@@ -1,0 +1,100 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+env/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Streamlit secrets (keep credentials out of git)
+.streamlit/secrets.toml
+
+# Local data
+*.sqlite
+data/
+tmp/
+
+# Environment variables
+# ---- Dotenv files: keep secrets out of git ----
+.env
+.env.*
+*.env
+*.env.*
+.venv/
+.venv311/
+.venv312/
+
+
+# Excldue these folders
+Documents for testing/
+Context documents/
+JSON outputs/
+
+# Repos from online
+_benchmark-main (online repo)/
+_docext-main (online repo)/
+
+#Samples
+Test samples to edit/
+Test samples/
+Documents for testing/
+Simulation Results/
+Ground Truth Discovery Hub/error_payloads/
+Ground Truth Discovery Hub/raw_payloads/
+Ground Truth Discovery Hub/LLM output/
+Ground Truth Discovery Hub/Debug/
+Ground Truth Discovery Hub/Temp/
+
+Docling payloads/
+Azure DI payloads/
+Adobe payloads/
+
+Document Pipeline/Reports/
+Document Pipeline/Cluster Results/
+Document Pipeline/Enhanced text info/
+Glyph_anomalies/Results/
+Glyph_anomalies/results_azure_di/
+Glyph_anomalies/results_azure_di_fixed/
+Glyph_anomalies/results_azure_di_v2/
+Glyph_anomalies/results_color_range/
+Glyph_anomalies/results_deepest_valleys/
+Glyph_anomalies/results_punctuation_mode/
+Glyph_anomalies/results_spacing_filter/
+Actual Use Cases/
+Document Pipeline/Adobe payloads/
+Document Pipeline/Docling payloads/
+Document Pipeline/Azure DI payloads/
+pikepdf payloads/
+PDF processing/
+Overlapping bboxes/
+Enhanced text info/
+Cluster results/
+
+# ---- But DO commit the template(s) ----
+!.env_example
+
+# Glyph anomalies - character images (too many to commit)
+Glyph_anomalies/results/characters/
+Glyph_anomalies/results_*/characters/
+Glyph_anomalies/intensity_debug/
+
+nul
