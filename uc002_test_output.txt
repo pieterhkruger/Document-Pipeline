@@ -1,0 +1,129 @@
+Testing UC-002: Baseline Confidence Scoring and Filtering
+Testing 3 documents...
+
+Processing: 85385859429 – Mr MP Madiya – False pay slip
+  Loaded 89 cells, page size: 595.260009765625x841.8599853515625pt
+
+Processing: 85393423298 – Mr G Motau - legitimate Capitec Bank statements
+  Loaded 127 cells, page size: 595.4400024414062x842.0399780273438pt
+
+Processing: 87026407408 – Mr I Fakude - False pay slip
+  Loaded 130 cells, page size: 595.2000122070312x841.6799926757812pt
+
+====================================================================================================
+UC-002 BASELINE CONFIDENCE FILTERING TEST RESULTS
+====================================================================================================
+
+1. 85385859429 – Mr MP Madiya – False pay slip
+----------------------------------------------------------------------------------------------------
+   Baseline Counts:
+      Unfiltered: 63 baselines
+      Filtered:   30 baselines
+      Reduction:  33 baselines (52.4%)
+
+   Quality Metrics:
+      Avg Confidence (Unfiltered): 0.071
+      Avg Confidence (Filtered):   0.12
+      Improvement:                 +0.049
+
+   Regression Check:
+      Threshold Range: 50.4 - 75.6 baselines
+      Filtered Count:  30 baselines
+      Status:          [FAIL]
+
+   Breakdown by Orientation:
+      Orientation     Unfiltered   Filtered     Reduction
+      --------------- ------------ ------------ ------------
+      left            6            6            0
+      right           6            6            0
+      top             24           0            24
+      bottom          27           18           9
+
+   Filtered Baselines (33 total):
+      1. bottom @  149.19pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      2. bottom @  274.11pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      3. bottom @  339.99pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      4. bottom @  399.57pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      5. bottom @  411.45pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      ... and 28 more
+
+2. 85393423298 – Mr G Motau - legitimate Capitec Bank statements
+----------------------------------------------------------------------------------------------------
+   Baseline Counts:
+      Unfiltered: 68 baselines
+      Filtered:   37 baselines
+      Reduction:  31 baselines (45.6%)
+
+   Quality Metrics:
+      Avg Confidence (Unfiltered): 0.112
+      Avg Confidence (Filtered):   0.171
+      Improvement:                 +0.060
+
+   Regression Check:
+      Threshold Range: 54.4 - 81.6 baselines
+      Filtered Count:  37 baselines
+      Status:          [FAIL]
+
+   Breakdown by Orientation:
+      Orientation     Unfiltered   Filtered     Reduction
+      --------------- ------------ ------------ ------------
+      left            11           11           0
+      right           6            6            0
+      top             17           0            17
+      bottom          34           20           14
+
+   Filtered Baselines (31 total):
+      1. bottom @   98.69pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      2. bottom @  110.75pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      3. bottom @  122.63pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      4. bottom @  134.69pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      5. bottom @  146.75pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      ... and 26 more
+
+3. 87026407408 – Mr I Fakude - False pay slip
+----------------------------------------------------------------------------------------------------
+   Baseline Counts:
+      Unfiltered: 56 baselines
+      Filtered:   44 baselines
+      Reduction:  12 baselines (21.4%)
+
+   Quality Metrics:
+      Avg Confidence (Unfiltered): 0.123
+      Avg Confidence (Filtered):   0.139
+      Improvement:                 +0.016
+
+   Regression Check:
+      Threshold Range: 44.8 - 67.2 baselines
+      Filtered Count:  44 baselines
+      Status:          [FAIL]
+
+   Breakdown by Orientation:
+      Orientation     Unfiltered   Filtered     Reduction
+      --------------- ------------ ------------ ------------
+      left            14           14           0
+      right           7            7            0
+      top             10           0            10
+      bottom          25           23           2
+
+   Filtered Baselines (12 total):
+      1. bottom @  581.33pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      2. bottom @  590.67pt, count=2, conf=0.040, reasons: low_confidence (0.040 < 0.05)
+      3. top    @   67.11pt, count=1, conf=0.020, reasons: low_confidence (0.020 < 0.05), low_support (1 < 2.0)
+      4. top    @  138.00pt, count=1, conf=0.159, reasons: low_support (1 < 2.0)
+      5. top    @  193.87pt, count=1, conf=0.020, reasons: low_confidence (0.020 < 0.05), low_support (1 < 2.0)
+      ... and 7 more
+
+====================================================================================================
+OVERALL SUMMARY
+====================================================================================================
+   Documents Tested: 3
+   Total Baselines (Unfiltered): 187
+   Total Baselines (Filtered):   111
+   Total Reduction:              76 baselines
+   Average Confidence Improvement: +0.042
+   Regression Tests Passed:      0/3
+   Overall Status:               [SOME FAILED]
+
+====================================================================================================
+
+Detailed results saved to: Alignment logic\uc002_baseline_confidence_test_results.json

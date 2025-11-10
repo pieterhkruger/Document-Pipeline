@@ -23,12 +23,36 @@ Usage:
 import streamlit as st
 import fitz  # PyMuPDF
 from pathlib import Path
-from typing import Dict, Tuple, Optional, Any, List
-from collections import defaultdict
+from typing import Dict, Tuple, Optional, Any, List, Set
+from collections import defaultdict, Counter
 import math
+from statistics import median
 import os
 import json
 import time
+import re
+
+# Import alignment and colon detection modules
+from alignment_detection import (
+    USE_BASELINE_CONFIDENCE_FILTERING,
+    detect_alignment_baselines as _alignment_detect_alignment_baselines,
+    detect_alignment_baselines_with_debug as _alignment_detect_alignment_baselines_with_debug,
+    detect_horizontal_alignment_anomalies,
+    build_alignment_metadata,
+    match_alignment_metadata,
+    consolidate_cells,
+    extract_bbox_coords,
+    calculate_iou,
+    refine_baselines_with_confidence_filtering
+)
+from colon_spacing_detection import (
+    detect_colon_spacing_anomalies,
+    analyze_value_content_type,
+    is_common_english_phrase
+)
+from text_block_detection import identify_text_blocks
+from alignment_logic_reporter import AlignmentLogicReporter
+from spatial_grid import SpatialGrid
 
 # Try to import pikepdf for better permission checking
 try:
@@ -60,6 +84,13 @@ try:
     HAS_CLUSTER_ANALYSIS = True
 except ImportError:
     HAS_CLUSTER_ANALYSIS = False
+
+# Try to import PDFPlumber
+try:
+    import pdfplumber
+    HAS_PDFPLUMBER = True
+except ImportError:
+    HAS_PDFPLUMBER = False
 
 TESSERACT_CMD_PATH: Optional[Path] = None
 TESSDATA_DIR_PATH: Optional[Path] = None
@@ -195,6 +226,10 @@ RAW_PAYLOADS_PATH = Path(__file__).parent.parent / "Glyph_anomalies" / "raw_payl
 PAYLOADS_PATH = Path(__file__).parent / "Docling payloads"
 ADOBE_PAYLOADS_PATH = Path(__file__).parent / "Adobe payloads"
 PIKEPDF_PAYLOADS_PATH = Path(__file__).parent / "pikepdf payloads"
+PDFPLUMBER_PAYLOADS_PATH = Path(__file__).parent / "PDFPlumber payloads"
+PDFPLUMBER_CHARS_PAYLOADS_PATH = Path(__file__).parent / "PDFPlumber payloads" / "Character-level"
+PDFPLUMBER_WORDS_PAYLOADS_PATH = Path(__file__).parent / "PDFPlumber payloads" / "Word-level"
+PYMUPDF_PAYLOADS_PATH = Path(__file__).parent / "PyMuPDF payloads"
 ENHANCED_TEXT_INFO_PATH = Path(__file__).parent / "Enhanced text info"
 AZURE_DI_PAYLOADS_PATH = Path(__file__).parent / "Azure DI payloads"
 CLUSTER_RESULTS_PATH = Path(__file__).parent / "Cluster Results"
@@ -204,6 +239,11 @@ PDF_PROCESSING_PATH = Path(__file__).parent / "PDF processing"
 USE_ADOBE_API_IF_AVAILABLE = True
 USE_AZURE_DI_API_IF_AVAILABLE = False
 USE_GOOGLE_API_IF_AVAILABLE = False
+
+# Payload generation control (for OCRed documents)
+USE_DOCLING_PAYLOAD = True
+USE_PDFPLUMBER_PAYLOAD = True
+USE_PYMUPDF_PAYLOAD = True
 
 
 # Hidden text detection parameters
@@ -224,6 +264,7 @@ DOCLING_ALIGNMENT_RIGHT_THRESHOLD = 1.5
 # Colon pattern detection thresholds (for label:value spacing analysis)
 COLON_SPACING_TOLERANCE = 2.0          # pt - deviation threshold for flagging anomalies
 COLON_MAX_DISTANCE = 75.0              # pt - maximum label-to-value distance (increased from 50.0)
+COLON_VALUE_CHAIN_MAX_DISTANCE = 20.0  # pt - maximum gap between chained value cells
 COLON_BASELINE_TOLERANCE = 3.0         # pt - vertical alignment tolerance (increased from 2.0)
 COLON_MIN_CLUSTER_SIZE = 3             # minimum items to establish a pattern
 COLON_RIGHT_ALIGN_TOLERANCE = 1.5      # pt - right edge alignment tolerance
@@ -242,6 +283,14 @@ LENIENT_WORD_SIMILARITY_THRESHOLD = 0.70
 LENIENT_PHRASE_SIMILARITY_THRESHOLD = 0.60
 SHOW_TEXT_NOT_RENDERED = False            # Toggle reporting/display of non-visible text items
 SHOW_ANOMALY_DETECTION = False            # Toggle anomaly detection reporting sections
+SHOW_TEXT_BLOCKS = True                   # Toggle rendering of text block overlays and summaries
+SHOW_RARE_FONT_PROPERTIES_DEFAULT = False # Default state for rare Adobe/pikepdf property overlays
+SHOW_VERTICAL_ALIGNMENT_DEFAULT = True    # Default state for vertical alignment overlay
+SHOW_HORIZONTAL_ALIGNMENT_DEFAULT = True  # Default state for horizontal alignment overlay
+SHOW_TEXT_BLOCKS_DEFAULT = True           # Default state for text blocks overlay
+SHOW_ALIGNMENT_FEATURES_DEFAULT = True    # Default state for alignment features (colon spacing + anomalies) overlay
+SHOW_TABLE_CELLS_DEFAULT = True           # Default state for table cells (green bbox borders) overlay
+SHOW_HIDDEN_TEXT_DEFAULT = True           # Default state for hidden text detection overlay
 
 # Try to import adobe runner for payload generation
 try:
@@ -1174,6 +1223,28 @@ def generate_docling_payload(pdf_path: Path, force_regenerate: bool = False) -> 
         pipeline_options.do_table_structure = True
         pipeline_options.generate_parsed_pages = True  # KEY: Enables cell-level word data
 
+        # Set artifacts_path to use local models instead of downloading from HuggingFace
+        # This path should contain the downloaded model folders:
+        #   - ds4sd--docling-layout-heron/
+        #   - ds4sd--docling-models/
+        #   - EasyOcr/
+        local_models_path = Path(__file__).parent / "models"
+        if local_models_path.exists():
+            pipeline_options.artifacts_path = local_models_path
+            print(f"Using local models from: {local_models_path}")
+
+            # Configure EasyOCR to use local models
+            easyocr_models_path = local_models_path / "EasyOcr"
+            if easyocr_models_path.exists():
+                pipeline_options.ocr_options.model_storage_directory = str(easyocr_models_path)
+                print(f"Using local EasyOCR models from: {easyocr_models_path}")
+            else:
+                print(f"EasyOCR models path not found: {easyocr_models_path}")
+                print("EasyOCR will use default model location")
+        else:
+            print(f"Local models path not found: {local_models_path}")
+            print("Models will be downloaded from HuggingFace API")
+
         # Configure format options
         format_options = {
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
@@ -1508,7 +1579,7 @@ def analyze_adobe_payload(payload_path: Path) -> Optional[Dict]:
                 page_number = page if page is not None else 0
 
                 # Get BBox for annotation rendering
-                bbox = node.get("BBox")
+                bbox = extract_adobe_bbox(node)
 
                 # Process embedded
                 if embedded is not None:
@@ -1682,6 +1753,206 @@ def analyze_adobe_payload(payload_path: Path) -> Optional[Dict]:
         return None
 
 
+def analyze_pymupdf_payload(payload_path: Path) -> Optional[Dict]:
+    """
+    Analyze PyMuPDF payload for font properties (font, size, color).
+    """
+    try:
+        with open(payload_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+
+        pages = payload.get("pages", [])
+        if not pages:
+            return None
+
+        font_stats = {}
+        size_stats = {}
+        color_stats = {}
+
+        font_items = {}
+        size_items = {}
+        color_items = {}
+
+        # Process each page
+        for page in pages:
+            page_num = page.get("page_number", 1) - 1  # Convert to 0-indexed
+
+            # Extract from text_dict which contains spans with font information
+            text_dict = page.get("text_dict", {})
+            blocks = text_dict.get("blocks", [])
+
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+
+                lines = block.get("lines", [])
+                for line in lines:
+                    if not isinstance(line, dict):
+                        continue
+
+                    spans = line.get("spans", [])
+                    for span in spans:
+                        if not isinstance(span, dict):
+                            continue
+
+                        text = span.get("text", "").strip()
+                        font = span.get("font")
+                        size = span.get("size")
+                        color = span.get("color")
+                        bbox_data = span.get("bbox")
+
+                        bbox = None
+                        if bbox_data and isinstance(bbox_data, (list, tuple)) and len(bbox_data) == 4:
+                            bbox = {"x0": bbox_data[0], "y0": bbox_data[1], "x1": bbox_data[2], "y1": bbox_data[3]}
+
+                        # Track font
+                        if font:
+                            font_key = str(font)
+                            font_stats[font_key] = font_stats.get(font_key, 0) + 1
+                            font_items.setdefault(font_key, []).append({
+                                "text": text,
+                                "page": page_num,
+                                "bbox": bbox
+                            })
+
+                        # Track size
+                        if size is not None:
+                            try:
+                                size_value = float(size)
+                                classification_key = "regular" if is_regular_measurement(size_value) else "irregular"
+                                size_stats[classification_key] = size_stats.get(classification_key, 0) + 1
+                                size_items.setdefault(classification_key, []).append({
+                                    "text": text,
+                                    "exact_size": size_value,
+                                    "classification": classification_key,
+                                    "classification_label": format_rounding_classification(classification_key),
+                                    "page": page_num,
+                                    "bbox": bbox
+                                })
+                            except (ValueError, TypeError):
+                                pass
+
+                        # Track color
+                        if color is not None:
+                            color_key = str(color)
+                            color_stats[color_key] = color_stats.get(color_key, 0) + 1
+                            color_items.setdefault(color_key, []).append({
+                                "text": text,
+                                "page": page_num,
+                                "bbox": bbox
+                            })
+
+        # Return analysis results
+        return {
+            "font": {
+                "stats": dict(sorted(font_stats.items(), key=lambda x: x[1], reverse=True)),
+                "items": font_items,
+                "total": sum(font_stats.values())
+            },
+            "size": {
+                "stats": dict(sorted(size_stats.items(), key=lambda x: x[1], reverse=True)),
+                "items": size_items,
+                "total": sum(size_stats.values())
+            },
+            "color": {
+                "stats": dict(sorted(color_stats.items(), key=lambda x: x[1], reverse=True)),
+                "items": color_items,
+                "total": sum(color_stats.values())
+            }
+        }
+
+    except Exception as e:
+        st.error(f"Error analyzing PyMuPDF payload: {e}")
+        return None
+
+
+def analyze_pdfplumber_payload(payload_path: Path) -> Optional[Dict]:
+    """
+    Analyze PDFPlumber payload for font properties (fontname, size).
+    """
+    try:
+        with open(payload_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+
+        pages = payload.get("pages", [])
+        if not pages:
+            return None
+
+        fontname_stats = {}
+        size_stats = {}
+
+        fontname_items = {}
+        size_items = {}
+
+        # Process each page
+        for page in pages:
+            page_num = page.get("page_number", 1) - 1  # Convert to 0-indexed
+            words = page.get("words", [])
+
+            for word in words:
+                if not isinstance(word, dict):
+                    continue
+
+                text = word.get("text", "").strip()
+                fontname = word.get("fontname")
+                size = word.get("size")
+
+                # Extract bbox
+                bbox = None
+                if all(k in word for k in ["x0", "top", "x1", "bottom"]):
+                    bbox = {
+                        "x0": word["x0"],
+                        "y0": word["top"],
+                        "x1": word["x1"],
+                        "y1": word["bottom"]
+                    }
+
+                # Track fontname
+                if fontname:
+                    fontname_key = str(fontname)
+                    fontname_stats[fontname_key] = fontname_stats.get(fontname_key, 0) + 1
+                    fontname_items.setdefault(fontname_key, []).append({
+                        "text": text,
+                        "page": page_num,
+                        "bbox": bbox
+                    })
+
+                # Track size
+                if size is not None:
+                    try:
+                        size_value = float(size)
+                        classification_key = "regular" if is_regular_measurement(size_value) else "irregular"
+                        size_stats[classification_key] = size_stats.get(classification_key, 0) + 1
+                        size_items.setdefault(classification_key, []).append({
+                            "text": text,
+                            "exact_size": size_value,
+                            "classification": classification_key,
+                            "classification_label": format_rounding_classification(classification_key),
+                            "page": page_num,
+                            "bbox": bbox
+                        })
+                    except (ValueError, TypeError):
+                        pass
+
+        # Return analysis results
+        return {
+            "fontname": {
+                "stats": dict(sorted(fontname_stats.items(), key=lambda x: x[1], reverse=True)),
+                "items": fontname_items,
+                "total": sum(fontname_stats.values())
+            },
+            "size": {
+                "stats": dict(sorted(size_stats.items(), key=lambda x: x[1], reverse=True)),
+                "items": size_items,
+                "total": sum(size_stats.values())
+            }
+        }
+
+    except Exception as e:
+        st.error(f"Error analyzing PDFPlumber payload: {e}")
+        return None
+
+
 def extract_bbox_coords(bbox: Dict) -> Tuple[float, float, float, float]:
     """
     Extract axis-aligned bounding box coordinates from various bbox formats.
@@ -1731,6 +2002,61 @@ def extract_bbox_coords(bbox: Dict) -> Tuple[float, float, float, float]:
 
     else:
         raise KeyError(f"Unknown bbox format, keys: {list(bbox.keys())}")
+
+
+def normalize_bbox_input(bbox_input: Any) -> Optional[Dict[str, float]]:
+    """
+    Normalize bbox-like inputs (dict/list/tuple) into {x0,y0,x1,y1} dictionaries.
+    """
+    if bbox_input is None:
+        return None
+
+    if isinstance(bbox_input, dict):
+        try:
+            x0, y0, x1, y1 = extract_bbox_coords(bbox_input)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return {
+            "x0": float(x0),
+            "y0": float(y0),
+            "x1": float(x1),
+            "y1": float(y1),
+        }
+
+    if isinstance(bbox_input, (list, tuple)) and len(bbox_input) >= 4:
+        x0, y0, x1, y1 = bbox_input[:4]
+        x0 = float(x0)
+        y0 = float(y0)
+        x1 = float(x1)
+        y1 = float(y1)
+        if x0 > x1:
+            x0, x1 = x1, x0
+        if y0 > y1:
+            y0, y1 = y1, y0
+        return {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
+
+    return None
+
+
+def extract_adobe_bbox(node: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """
+    Adobe/pikepdf payload nodes may store bbox information under multiple keys.
+    Attempt to normalize any available bbox-like structure.
+    """
+    candidates: List[Any] = [node.get("BBox")]
+
+    attributes = node.get("attributes")
+    if isinstance(attributes, dict):
+        candidates.append(attributes.get("BBox"))
+
+    candidates.append(node.get("Bounds"))
+
+    for candidate in candidates:
+        normalized = normalize_bbox_input(candidate)
+        if normalized:
+            return normalized
+
+    return None
 
 
 def normalize_cell_bbox(cell: Dict[str, Any]) -> Tuple[Dict[str, float], bool, str]:
@@ -1857,6 +2183,230 @@ def extract_table_cells_from_docling(docling_payload: Dict[str, Any]) -> List[Di
             })
 
     return table_annotations
+
+
+def extract_docling_layout_blocks(docling_payload: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Extract layout blocks from Docling payload:
+    - Table columns as blocks
+    - Paragraphs/text blocks as blocks
+
+    Returns:
+        Dict mapping page_num (0-indexed) to list of block dicts with 'bbox' and 'type'
+    """
+    blocks_by_page: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+    if not isinstance(docling_payload, dict):
+        return blocks_by_page
+
+    doc_struct = docling_payload.get("docling_document", {})
+    if not isinstance(doc_struct, dict):
+        return blocks_by_page
+
+    # Extract table columns as blocks
+    tables = doc_struct.get("tables", [])
+    if isinstance(tables, list):
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+
+            # Get page number
+            prov_entries = table.get("prov", [])
+            page_index: Optional[int] = None
+            if isinstance(prov_entries, list):
+                for prov in prov_entries:
+                    if not isinstance(prov, dict):
+                        continue
+                    page_no = prov.get("page_no")
+                    if page_no is None:
+                        continue
+                    try:
+                        page_no = int(page_no)
+                    except (TypeError, ValueError):
+                        continue
+                    page_index = page_no - 1 if page_no > 0 else page_no
+                    break
+
+            if page_index is None:
+                continue
+
+            # Extract table structure
+            data = table.get("data", {})
+            grid = data.get("grid")
+
+            if not isinstance(grid, list) or not grid:
+                continue
+
+            # Determine number of columns from first row
+            first_row = grid[0] if grid else []
+            if not isinstance(first_row, list):
+                continue
+
+            num_cols = len(first_row)
+
+            # For each column, collect all cells and compute bounding box
+            for col_idx in range(num_cols):
+                col_bboxes = []
+
+                for row in grid:
+                    if not isinstance(row, list) or col_idx >= len(row):
+                        continue
+
+                    cell = row[col_idx]
+                    if not isinstance(cell, dict):
+                        continue
+
+                    bbox = cell.get("bbox")
+                    if not isinstance(bbox, dict):
+                        continue
+
+                    try:
+                        x0, y0, x1, y1 = extract_bbox_coords(bbox)
+                        col_bboxes.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1})
+                    except Exception:
+                        continue
+
+                # Compute column bounding box (union of all cells)
+                if col_bboxes:
+                    min_x0 = min(b["x0"] for b in col_bboxes)
+                    min_y0 = min(b["y0"] for b in col_bboxes)
+                    max_x1 = max(b["x1"] for b in col_bboxes)
+                    max_y1 = max(b["y1"] for b in col_bboxes)
+
+                    blocks_by_page[page_index].append({
+                        "bbox": {"x0": min_x0, "y0": min_y0, "x1": max_x1, "y1": max_y1},
+                        "type": "table_column",
+                        "column_index": col_idx
+                    })
+
+    # Extract paragraphs/text blocks
+    texts = doc_struct.get("texts", [])
+    if isinstance(texts, list):
+        for text_elem in texts:
+            if not isinstance(text_elem, dict):
+                continue
+
+            # Get page number
+            prov_entries = text_elem.get("prov", [])
+            page_index: Optional[int] = None
+            if isinstance(prov_entries, list):
+                for prov in prov_entries:
+                    if not isinstance(prov, dict):
+                        continue
+                    page_no = prov.get("page_no")
+                    if page_no is None:
+                        continue
+                    try:
+                        page_no = int(page_no)
+                    except (TypeError, ValueError):
+                        continue
+                    page_index = page_no - 1 if page_no > 0 else page_no
+
+                    # Get bbox from prov
+                    bbox = prov.get("bbox")
+                    if isinstance(bbox, dict):
+                        try:
+                            x0, y0, x1, y1 = extract_bbox_coords(bbox)
+                            blocks_by_page[page_index].append({
+                                "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                                "type": "paragraph",
+                                "text": text_elem.get("text", "")[:50]  # First 50 chars for reference
+                            })
+                        except Exception:
+                            pass
+                    break
+
+    return blocks_by_page
+
+
+def extract_pdfplumber_layout_blocks(pdfplumber_payload: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Extract layout blocks from PDFPlumber payload:
+    - Table columns as blocks
+
+    Returns:
+        Dict mapping page_num (0-indexed) to list of block dicts with 'bbox' and 'type'
+    """
+    blocks_by_page: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+    if not isinstance(pdfplumber_payload, dict):
+        return blocks_by_page
+
+    pages = pdfplumber_payload.get("pages", [])
+    if not isinstance(pages, list):
+        return blocks_by_page
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+
+        page_num = page.get("page_number", 1) - 1  # Convert to 0-indexed
+        page_height = page.get("height")
+
+        tables = page.get("tables", [])
+        if not isinstance(tables, list):
+            continue
+
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+
+            table_data = table.get("data")
+            if not isinstance(table_data, list) or not table_data:
+                continue
+
+            # PDFPlumber extract_tables() returns table as 2D array
+            # Need to infer column bboxes from words
+            # For now, we'll skip detailed column extraction from PDFPlumber
+            # as it doesn't directly provide column bboxes
+            # Instead, we'll just mark that table exists
+            pass
+
+    return blocks_by_page
+
+
+def extract_pymupdf_layout_blocks(pymupdf_payload: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Extract layout blocks from PyMuPDF payload using text_blocks.
+
+    Returns:
+        Dict mapping page_num (0-indexed) to list of block dicts with 'bbox' and 'type'
+    """
+    blocks_by_page: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+    if not isinstance(pymupdf_payload, dict):
+        return blocks_by_page
+
+    pages = pymupdf_payload.get("pages", [])
+    if not isinstance(pages, list):
+        return blocks_by_page
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+
+        page_num = page.get("page_number", 1) - 1  # Convert to 0-indexed
+
+        text_blocks = page.get("text_blocks", [])
+        if not isinstance(text_blocks, list):
+            continue
+
+        for block in text_blocks:
+            # PyMuPDF text_blocks format: (x0, y0, x1, y1, "text", block_no, block_type)
+            if isinstance(block, (list, tuple)) and len(block) >= 4:
+                try:
+                    x0, y0, x1, y1 = float(block[0]), float(block[1]), float(block[2]), float(block[3])
+                    text = block[4] if len(block) > 4 else ""
+
+                    blocks_by_page[page_num].append({
+                        "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                        "type": "text_block",
+                        "text": text[:50] if isinstance(text, str) else ""  # First 50 chars
+                    })
+                except (ValueError, TypeError):
+                    continue
+
+    return blocks_by_page
 
 
 def build_alignment_metadata(docling_payload: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
@@ -2061,122 +2611,174 @@ def consolidate_cells(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return consolidated
 
 
-def detect_alignment_baselines(
-    cells: List[Dict[str, Any]],
-    page_width: float,
-    page_metadata: Optional[List[Dict[str, Any]]] = None
+def detect_alignment_baselines_with_debug(*args, **kwargs):
+    """Delegates to alignment_detection version (avoids duplicate logic)."""
+    return _alignment_detect_alignment_baselines_with_debug(*args, **kwargs)
+
+
+def detect_alignment_baselines(*args, **kwargs):
+    """Delegates to alignment_detection version (avoids duplicate logic)."""
+    return _alignment_detect_alignment_baselines(*args, **kwargs)
+
+
+def _bboxes_overlap_vertically(bbox1: Dict[str, float], bbox2: Dict[str, float], tolerance: float = 5.0) -> bool:
+    """
+    Check if two bounding boxes overlap vertically (have similar y-range).
+
+    Args:
+        bbox1: First bbox with y0, y1 keys
+        bbox2: Second bbox with y0, y1 keys
+        tolerance: Additional tolerance in points for overlap detection
+
+    Returns:
+        True if bboxes overlap vertically
+    """
+    if not bbox1 or not bbox2:
+        return False
+
+    y0_1 = bbox1.get("y0", 0)
+    y1_1 = bbox1.get("y1", 0)
+    y0_2 = bbox2.get("y0", 0)
+    y1_2 = bbox2.get("y1", 0)
+
+    # Expand by tolerance
+    y0_1 -= tolerance
+    y1_1 += tolerance
+    y0_2 -= tolerance
+    y1_2 += tolerance
+
+    # Check if ranges overlap
+    return not (y1_1 < y0_2 or y1_2 < y0_1)
+
+
+def build_vertical_alignment_anomalies(
+    blocks: List[Dict[str, Any]],
+    page_no: int,
+    min_confidence: float = 0.7,
+    min_deviation_pt: float = 1.5,
+    baselines: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Detect alignment baselines (dominant left/right edges) in a page.
+    Generate anomaly entries for cells that deviate from a block's dominant
+    left/right alignment baseline.
 
-    Returns list of baselines with:
-    - orientation: "left" or "right"
-    - value: x-coordinate of the baseline
-    - page_position: "page_left", "page_right", or "mid_page"
-    - y_values: list of y-coordinates of blocks aligned to this baseline
-    - count: number of items aligned to this baseline
+    NEW: Checks BOTH left and right alignment possibilities using baselines.
+    Only flags as anomaly if cell deviates significantly from BOTH alignments.
     """
-    if not cells:
-        return []
+    anomalies: List[Dict[str, Any]] = []
+    if not blocks:
+        return anomalies
 
-    # Filter out structural elements using metadata
-    filtered_cells = []
-    for cell in cells:
-        if page_metadata:
-            match = match_alignment_metadata(cell["bbox"], page_metadata, min_iou=0.6)
-            if match:
-                # Skip table headers and section headers
-                if match.get("column_header") or match.get("row_header"):
-                    continue
-                if match.get("label") == "section_header":
-                    continue
+    # Extract left and right baselines for alternative alignment checking
+    left_baselines = []
+    right_baselines = []
+    if baselines:
+        for baseline in baselines:
+            orientation = baseline.get("orientation")
+            value = baseline.get("value")
+            if value is not None:
+                if orientation == "left":
+                    left_baselines.append(value)
+                elif orientation == "right":
+                    right_baselines.append(value)
 
-        filtered_cells.append(cell)
+    print(f"[Page {page_no}] Found {len(left_baselines)} left baselines and {len(right_baselines)} right baselines for alternative alignment checking")
 
-    if not filtered_cells:
-        return []
-
-    # Cluster left and right edges at 0.1pt precision
-    left_clusters: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
-    right_clusters: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
-
-    for cell in filtered_cells:
-        bbox = cell["bbox"]
-        left_edge = bbox["x0"]
-        right_edge = bbox["x1"]
-
-        # Round to 0.1pt for clustering
-        left_key = round(left_edge, 1)
-        right_key = round(right_edge, 1)
-
-        left_clusters[left_key].append(cell)
-        right_clusters[right_key].append(cell)
-
-    baselines = []
-
-    # Process left-aligned baselines
-    for cluster_key, cluster_cells in left_clusters.items():
-        if len(cluster_cells) < 3:  # Require at least 3 items
+    for block in blocks:
+        meta = (block or {}).get("alignment_metadata") or {}
+        alignment_type = meta.get("alignment_type")
+        if alignment_type not in ("left", "right"):
             continue
 
-        # Calculate mean x-coordinate
-        mean_x = sum(c["bbox"]["x0"] for c in cluster_cells) / len(cluster_cells)
-
-        # Collect y-values (use center y for each block)
-        y_values = [(c["bbox"]["y0"] + c["bbox"]["y1"]) / 2 for c in cluster_cells]
-
-        # Determine page position
-        if mean_x < page_width * 0.25:
-            page_position = "page_left"
-        elif mean_x > page_width * 0.75:
-            page_position = "page_right"
-        else:
-            page_position = "mid_page"
-
-        baselines.append({
-            "orientation": "left",
-            "value": mean_x,
-            "page_position": page_position,
-            "y_values": y_values,
-            "count": len(cluster_cells)
-        })
-
-    # Process right-aligned baselines
-    for cluster_key, cluster_cells in right_clusters.items():
-        if len(cluster_cells) < 3:  # Require at least 3 items
+        confidence = meta.get("confidence", 0.0)
+        baseline_value = meta.get("baseline_value")
+        deviations = meta.get("deviations") or []
+        if baseline_value is None or confidence < min_confidence or not deviations:
             continue
 
-        # Calculate mean x-coordinate
-        mean_x = sum(c["bbox"]["x1"] for c in cluster_cells) / len(cluster_cells)
+        block_id = block.get("block_id")
 
-        # Collect y-values (use center y for each block)
-        y_values = [(c["bbox"]["y0"] + c["bbox"]["y1"]) / 2 for c in cluster_cells]
+        # Determine alternative alignment type and baselines to check
+        alternative_type = "right" if alignment_type == "left" else "left"
+        alternative_baselines = right_baselines if alignment_type == "left" else left_baselines
 
-        # Determine page position
-        if mean_x < page_width * 0.25:
-            page_position = "page_left"
-        elif mean_x > page_width * 0.75:
-            page_position = "page_right"
-        else:
-            page_position = "mid_page"
+        for deviation in deviations:
+            deviation_value = deviation.get("deviation")
+            if deviation_value is None or abs(deviation_value) < min_deviation_pt:
+                continue
+            bbox = deviation.get("cell_bbox") or {}
+            if not bbox:
+                continue
+            text = deviation.get("cell_text", "").strip()
+            if not _is_probably_numeric_value(text):
+                continue
 
-        baselines.append({
-            "orientation": "right",
-            "value": mean_x,
-            "page_position": page_position,
-            "y_values": y_values,
-            "count": len(cluster_cells)
-        })
+            # Check if this cell could satisfy the alternative alignment
+            # For right-aligned blocks, check if cell's LEFT edge aligns with any left baseline
+            # For left-aligned blocks, check if cell's RIGHT edge aligns with any right baseline
+            if alignment_type == "right":
+                # Check if LEFT edge (x0) aligns with left baselines
+                cell_edge = bbox.get("x0", 0)
+            else:
+                # Check if RIGHT edge (x1) aligns with right baselines
+                cell_edge = bbox.get("x1", 0)
 
-    # Sort baselines by count (descending) then by value
-    baselines.sort(key=lambda b: (-b["count"], b["value"]))
+            satisfies_alternative = False
 
-    return baselines
+            # Check against alternative alignment baselines
+            if alternative_baselines:
+                print(f"[Page {page_no}] Checking text '{text}' (edge={cell_edge:.2f}) against {len(alternative_baselines)} {alternative_type} baselines")
+                for alt_baseline in alternative_baselines:
+                    # Calculate deviation from alternative alignment baseline
+                    alt_deviation = abs(cell_edge - alt_baseline)
+                    print(f"  {alternative_type.capitalize()} baseline {alt_baseline:.2f}: deviation={alt_deviation:.2f}pt (threshold={min_deviation_pt}pt)")
+
+                    # If deviation from alternative is acceptable, don't flag
+                    if alt_deviation < min_deviation_pt:
+                        satisfies_alternative = True
+                        print(f"    -> SATISFIES {alternative_type} alignment at {alt_baseline:.2f}pt! Not flagging.")
+                        break
+
+                if not satisfies_alternative:
+                    print(f"    -> Does NOT satisfy any {alternative_type} alignment. Will flag.")
+            else:
+                print(f"[Page {page_no}] No {alternative_type} baselines available for comparison")
+
+            # Only create anomaly if it fails BOTH alignments
+            if satisfies_alternative:
+                continue
+
+            expected = deviation.get("expected_edge")
+            actual_edge = deviation.get("actual_edge")
+            reason = (
+                f"{alignment_type.title()}-aligned column expected edge {expected}pt, "
+                f"found {actual_edge}pt (Δ {deviation_value:+.2f}pt)."
+            )
+
+            anomalies.append({
+                "page": page_no,
+                "text": text,
+                "value_text": text,
+                "bbox": bbox,
+                "classification": "vertical_alignment_deviation",
+                "reason": reason,
+                "details": reason,
+                "alignment_type": alignment_type,
+                "alignment_confidence": confidence,
+                "expected_edge": expected,
+                "actual_edge": actual_edge,
+                "deviation": deviation_value,
+                "alignment_baseline": baseline_value,
+                "block_id": block_id,
+            })
+
+    return anomalies
 
 
 def detect_docling_alignment_anomalies(
     docling_payload: Dict[str, Any],
-    target_labels: Optional[List[str]] = None
+    target_labels: Optional[List[str]] = None,
+    reporter: Optional[AlignmentLogicReporter] = None
 ) -> List[Dict[str, Any]]:
     """
     Detect misalignment issues using baseline detection approach.
@@ -2203,8 +2805,16 @@ def detect_docling_alignment_anomalies(
 
     alignment_metadata = build_alignment_metadata(docling_payload)
 
+    # Import text block detection functions (needed for both preliminary and final passes)
+    from text_block_detection import (
+        USE_ITERATIVE, USE_TWO_STAGE, USE_DBSCAN,
+        identify_text_blocks_iterative, identify_text_blocks_two_stage, identify_text_blocks_dbscan, identify_text_blocks,
+        extract_table_metadata, refine_text_blocks
+    )
+
     # Store baselines for each page (will be used for rendering)
     baselines_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    text_blocks_by_page: Dict[int, List[Dict[str, Any]]] = {}
 
     anomalies: List[Dict[str, Any]] = []
 
@@ -2226,6 +2836,7 @@ def detect_docling_alignment_anomalies(
         # Get page dimensions
         page_size = page_data.get("size", {})
         page_width = page_size.get("width", 612)  # Default to letter width if not found
+        page_height = page_size.get("height", 792)  # Default to letter height if not found
 
         # Normalize cells
         normalized_cells = []
@@ -2246,11 +2857,23 @@ def detect_docling_alignment_anomalies(
             except Exception:
                 continue
 
+            # Extract font information if available
+            font_info = {}
+            if 'font' in cell:
+                font_info['font'] = cell['font']
+            if 'font_size' in cell:
+                font_info['font_size'] = cell['font_size']
+            if 'font_name' in cell:
+                font_info['font_name'] = cell['font_name']
+            if 'font_family' in cell:
+                font_info['font_family'] = cell['font_family']
+
             normalized_cells.append({
                 "text": text,
                 "text_lower": text.lower(),
                 "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
-                "metadata": {}
+                "metadata": {},
+                "font_info": font_info if font_info else None
             })
 
         if not normalized_cells:
@@ -2267,381 +2890,287 @@ def detect_docling_alignment_anomalies(
                 if match:
                     entry["metadata"] = match
 
-        # Detect alignment baselines for this page
-        baselines = detect_alignment_baselines(consolidated_cells, page_width, page_metadata)
-        baselines_by_page[page_no] = baselines
+        if reporter:
+            reporter.record_page_overview(
+                page_no,
+                total_cells=len(cells),
+                consolidated_cells=len(consolidated_cells),
+            )
 
-        # TODO: Future implementation - check for anomalies based on baselines
-        # For now, we just detect and store baselines without flagging anomalies
+        # Extract Docling table metadata for this page (used by table-aware clustering)
+        tables_metadata = extract_table_metadata(docling_payload, page_no)
+
+        # Detect alignment baselines for this page (initial pass for block detection)
+        initial_baselines, initial_debug = detect_alignment_baselines_with_debug(
+            consolidated_cells, page_width, page_metadata, page_height
+        )
+        if reporter:
+            reporter.record_baseline_stage(page_no, "initial", initial_baselines, initial_debug)
+
+        preliminary_debug: Dict[str, Any] = {}
+        preliminary_blocks = identify_text_blocks(
+            consolidated_cells,
+            initial_baselines,
+            debug=preliminary_debug
+        )
+        if reporter:
+            reporter.record_text_block_stage(page_no, "preliminary", preliminary_debug)
+
+        # Re-run baseline detection with block anchors for tighter vertical alignment
+        baselines, debug_info = detect_alignment_baselines_with_debug(
+            consolidated_cells, page_width, page_metadata, page_height, blocks=preliminary_blocks
+        )
+
+        # Apply confidence-based filtering (UC-002) if enabled
+        if USE_BASELINE_CONFIDENCE_FILTERING:
+            confidence_debug: Dict[str, Any] = {}
+            baselines = refine_baselines_with_confidence_filtering(
+                baselines, page_width, page_height, debug=confidence_debug
+            )
+            # Merge confidence debug info into main debug_info
+            if confidence_debug:
+                debug_info["confidence_filtering"] = confidence_debug.get("baseline_filtering", {})
+
+        baselines_by_page[page_no] = baselines
+        if reporter:
+            reporter.record_baseline_stage(page_no, "refined", baselines, debug_info)
+
+        # Identify high-level text blocks using the refined baselines
+        final_block_debug: Dict[str, Any] = {}
+
+        # Choose clustering approach
+        if USE_ITERATIVE:
+            text_blocks = identify_text_blocks_iterative(
+                consolidated_cells,
+                baselines,
+                tables=tables_metadata,
+                debug=final_block_debug
+            )
+        elif USE_TWO_STAGE:
+            text_blocks = identify_text_blocks_two_stage(consolidated_cells, baselines, debug=final_block_debug)
+        elif USE_DBSCAN:
+            text_blocks = identify_text_blocks_dbscan(consolidated_cells, baselines, debug=final_block_debug)
+        else:
+            text_blocks = identify_text_blocks(consolidated_cells, baselines, debug=final_block_debug)
+
+        # Apply UC-005 refinement (merging, nesting cleanup, weak evidence filtering)
+        refined_blocks = text_blocks
+        refinement_stats = None
+        if text_blocks:
+            refinement_result = refine_text_blocks(
+                text_blocks,
+                tables=tables_metadata,
+                page_height=page_height
+            )
+            refined_blocks = refinement_result.get("blocks", text_blocks)
+            refinement_stats = refinement_result.get("stats")
+            final_block_debug["refinement"] = refinement_stats
+
+        text_blocks_by_page[page_no] = refined_blocks
+        if reporter:
+            reporter.record_text_block_stage(page_no, "final", final_block_debug)
+            if refinement_stats:
+                reporter.record_text_block_stage(
+                    page_no,
+                    "refined",
+                    {"stats": refinement_stats, "block_count": len(refined_blocks)}
+                )
+            # Note: Text blocks are NOT recorded as highlighted_items because they are structural
+            # elements, not suspicious items. They appear in text_blocks section instead.
+
+        block_alignment_anomalies = build_vertical_alignment_anomalies(
+            refined_blocks,
+            page_no,
+            baselines=baselines,  # Pass baselines for alternative alignment checking
+        )
+        if block_alignment_anomalies:
+            anomalies.extend(block_alignment_anomalies)
+            if reporter:
+                for anomaly in block_alignment_anomalies:
+                    reporter.record_highlighted_item(
+                        page_no=page_no,
+                        item_type="vertical_alignment_deviation",
+                        item_data={
+                            "text": anomaly.get("text", ""),
+                            "bbox": anomaly.get("bbox"),
+                            "classification": anomaly.get("classification"),
+                            "reason": anomaly.get("reason", ""),
+                            "alignment_type": anomaly.get("alignment_type"),
+                            "alignment_confidence": anomaly.get("alignment_confidence"),
+                            "block_id": anomaly.get("block_id"),
+                        }
+                    )
+
+        # Store debug info
+        if page_no not in docling_payload:
+            docling_payload[f"_baseline_debug_{page_no}"] = debug_info
+        else:
+            docling_payload[f"_baseline_debug_{page_no}"] = debug_info
+
+        # Detect horizontal alignment anomalies using the detected baselines
+        horizontal_anomalies = detect_horizontal_alignment_anomalies(
+            consolidated_cells, baselines, page_no, page_metadata,
+            analyze_value_content_type_func=analyze_value_content_type,
+            is_common_english_phrase_func=is_common_english_phrase
+        )
+        if horizontal_anomalies:
+            anomalies.extend(horizontal_anomalies)
+
+            # Record horizontal alignment anomalies as highlighted items
+            if reporter:
+                for anomaly in horizontal_anomalies:
+                    reporter.record_highlighted_item(
+                        page_no=page_no,
+                        item_type="horizontal_misalignment",
+                        item_data={
+                            "text": anomaly.get("text", ""),
+                            "bbox": anomaly.get("bbox"),
+                            "classification": anomaly.get("classification", ""),
+                            "reason": anomaly.get("reason", ""),
+                            "counter_evidence": anomaly.get("counter_evidence"),
+                            "font_info": anomaly.get("font_info")
+                        }
+                    )
 
     # Store baselines in the payload for rendering
     if baselines_by_page:
         docling_payload["_alignment_baselines"] = baselines_by_page
+    if text_blocks_by_page:
+        docling_payload["_text_blocks"] = text_blocks_by_page
 
-    # Return empty anomalies list for now (baseline-based anomaly detection to be implemented)
-    # Baselines are stored in docling_payload["_alignment_baselines"] for visualization
+    # Return detected anomalies
     return anomalies
 
 
 # =============================================================================
 
 
-def detect_colon_spacing_anomalies(
-    docling_payload: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+def analyze_value_content_type(text: str) -> Dict[str, Any]:
     """
-    Detect spacing inconsistencies in label:value pairs separated by colons.
+    Analyze the content type of a value to determine suspiciousness level.
 
-    This detects forgery by finding deviations from the dominant spacing pattern
-    in colon-separated label-value pairs (e.g., "EMP.CODE: HM20927").
+    Uses NLP-like heuristics to detect:
+    - Names (proper nouns with title case)
+    - Currency amounts
+    - Numbers
+    - Dates
 
     Returns:
-        List of anomalies with classification:
-        - 'consistent': Green - matches dominant pattern
-        - 'deviation': Red - spacing deviation (potential forgery)
-        - 'right_aligned': Orange - right-aligned exception
+        Dict with:
+        - content_type: 'name', 'currency', 'number', 'date', 'text'
+        - suspicion_multiplier: float (1.0 = normal, >1.0 = more suspicious)
+        - details: str describing the content type
     """
     import re
 
-    if not isinstance(docling_payload, dict):
-        return []
+    text = text.strip()
 
-    parsed_pages = docling_payload.get("parsed_pages")
-    if not isinstance(parsed_pages, dict):
-        return []
-
-    all_anomalies: List[Dict[str, Any]] = []
-
-    for page_key, page_data in parsed_pages.items():
-        if not isinstance(page_data, dict):
-            continue
-
-        cells = page_data.get("cells", [])
-        if not isinstance(cells, list) or not cells:
-            continue
-
-        page_no = page_data.get("page_no")
-        if page_no is None:
-            try:
-                page_no = int(page_key)
-            except (TypeError, ValueError):
-                continue
-
-        # Normalize ALL cells (not just those with colons - we need values too!)
-        normalized_cells = []
-        for cell in cells:
-            if not isinstance(cell, dict):
-                continue
-
-            text = (cell.get("text") or "").strip()
-            if not text:
-                continue
-
-            rect = cell.get("rect") or cell.get("bbox")
-            if not isinstance(rect, dict):
-                continue
-
-            try:
-                x0, y0, x1, y1 = extract_bbox_coords(rect)
-            except Exception:
-                continue
-
-            normalized_cells.append({
-                "text": text,
-                "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
-            })
-
-        if not normalized_cells:
-            continue
-
-        # Extract colon pairs
-        colon_pairs = extract_colon_pairs(normalized_cells)
-
-        if len(colon_pairs) < 2:  # Need at least 2 pairs to establish a pattern
-            continue
-
-        # Analyze spacing patterns
-        spacing_analysis = analyze_colon_spacing(colon_pairs)
-
-        if not spacing_analysis:
-            continue
-
-        dominant_spacing = spacing_analysis['dominant_spacing']
-
-        # Detect right-aligned values
-        right_aligned_indices = detect_right_aligned_values(colon_pairs)
-
-        # Classify each pair
-        for idx, pair in enumerate(colon_pairs):
-            spacing = pair['spacing']
-            deviation = abs(spacing - dominant_spacing)
-
-            # Determine classification
-            if idx in right_aligned_indices:
-                # Right-aligned exception (orange)
-                classification = 'right_aligned'
-                reason = f"Right-aligned value (spacing: {spacing:.1f}pt, pattern: {dominant_spacing:.1f}pt)"
-            elif deviation <= COLON_SPACING_TOLERANCE:
-                # Consistent with pattern (green)
-                classification = 'consistent'
-                reason = f"Consistent spacing (spacing: {spacing:.1f}pt, pattern: {dominant_spacing:.1f}pt)"
-            else:
-                # Deviation from pattern (red - potential forgery)
-                classification = 'deviation'
-                reason = f"Spacing deviation (spacing: {spacing:.1f}pt, pattern: {dominant_spacing:.1f}pt, deviation: {deviation:.1f}pt)"
-
-            all_anomalies.append({
-                'page': page_no,
-                'label': pair['label'],
-                'value': pair['value'],
-                'bbox': pair['value_bbox'],
-                'label_bbox': pair['label_bbox'],
-                'classification': classification,
-                'spacing': spacing,
-                'dominant_spacing': dominant_spacing,
-                'deviation': deviation,
-                'reason': reason
-            })
-
-    return all_anomalies
-
-
-def extract_colon_pairs(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Extract label:value pairs from cells containing colons.
-
-    Handles two cases:
-    1. Label and value in same cell: "LABEL: VALUE"
-    2. Label and value in separate cells: "LABEL:" in one cell, "VALUE" in next cell
-
-    Returns list of pairs with spacing information.
-    """
-    import re
-
-    pairs = []
-
-    for i, cell in enumerate(cells):
-        text = cell['text']
-        bbox = cell['bbox']
-
-        # Skip if colon is part of time/date/URL
-        if is_excluded_colon(text):
-            continue
-
-        # Case 1: Label ends with colon (separate cells)
-        if text.endswith(':'):
-            label_text = text
-            label_bbox = bbox
-
-            # Find value cell (next cell on same baseline, to the right)
-            value_cell = None
-            label_center_y = (bbox['y0'] + bbox['y1']) / 2
-
-            for j in range(i + 1, len(cells)):
-                candidate = cells[j]
-                candidate_bbox = candidate['bbox']
-
-                # Check if on same baseline (within 2pt)
-                candidate_center_y = (candidate_bbox['y0'] + candidate_bbox['y1']) / 2
-                if abs(candidate_center_y - label_center_y) > COLON_BASELINE_TOLERANCE:
-                    continue
-
-                # Check if to the right
-                if candidate_bbox['x0'] <= bbox['x1']:
-                    continue
-
-                # Check if reasonably close
-                horizontal_gap = candidate_bbox['x0'] - bbox['x1']
-                if horizontal_gap > COLON_MAX_DISTANCE:
-                    continue
-
-                # Found potential value cell
-                value_cell = candidate
-                break
-
-            if not value_cell:
-                continue
-
-            value_text = value_cell['text']
-            value_bbox = value_cell['bbox']
-
-            # Calculate spacing (from label right edge to value left edge)
-            spacing = value_bbox['x0'] - label_bbox['x1']
-
-            pairs.append({
-                'label': label_text,
-                'value': value_text,
-                'label_bbox': label_bbox,
-                'value_bbox': value_bbox,
-                'spacing': spacing,
-                'full_text': f"{label_text} {value_text}",
-                'full_bbox': bbox
-            })
-
-        # Case 2: Label and value in same cell: "LABEL: VALUE"
-        elif ':' in text:
-            colon_idx = text.find(':')
-            label_text = text[:colon_idx + 1].strip()
-            value_text = text[colon_idx + 1:].strip()
-
-            # Skip if no value after colon
-            if not value_text:
-                continue
-
-            # Estimate positions (simplified - assumes monospace-ish layout)
-            text_width = bbox['x1'] - bbox['x0']
-            colon_ratio = (colon_idx + 1) / len(text)
-
-            # Estimate colon position
-            colon_x = bbox['x0'] + (text_width * colon_ratio)
-
-            # Estimate value start position
-            value_start_ratio = (colon_idx + 1 + (len(text) - len(text[colon_idx + 1:].lstrip()))) / len(text)
-            value_x0 = bbox['x0'] + (text_width * value_start_ratio)
-
-            # Calculate spacing (distance from colon to value start)
-            spacing = value_x0 - colon_x
-
-            # Create label and value bboxes (estimates)
-            label_bbox = {
-                'x0': bbox['x0'],
-                'y0': bbox['y0'],
-                'x1': colon_x,
-                'y1': bbox['y1']
+    # Currency detection (with symbols or common patterns)
+    currency_patterns = [
+        r'^\$?\s*\d{1,3}(,\d{3})*(\.\d{2})?$',  # $1,234.56 or 1,234.56
+        r'^\d{1,3}(,\d{3})*(\.\d{2})?\s*$',     # 1,234.56
+        r'^R\s*\d+(\.\d{2})?$',                   # R1234.56 (South African Rand)
+        r'^€\s*\d+(\.\d{2})?$',                   # €1234.56
+        r'^£\s*\d+(\.\d{2})?$',                   # £1234.56
+        r'^\d+\.\d{2}$',                          # 123.45 (likely currency)
+    ]
+    for pattern in currency_patterns:
+        if re.match(pattern, text):
+            return {
+                'content_type': 'currency',
+                'suspicion_multiplier': 2.5,  # Very suspicious if currency is misaligned
+                'details': 'Currency amount'
             }
 
-            value_bbox = {
-                'x0': value_x0,
-                'y0': bbox['y0'],
-                'x1': bbox['x1'],
-                'y1': bbox['y1']
+    # Number detection (including IDs, phone numbers, etc.)
+    number_patterns = [
+        r'^\d+$',                                # Pure digits
+        r'^\d{2,}[/-]\d{2,}[/-]\d{2,}$',        # ID numbers like 12-345-67
+        r'^\d{10,}$',                            # Long numbers (likely IDs)
+        r'^[A-Z]{1,3}\d+$',                      # Codes like AB123
+    ]
+    for pattern in number_patterns:
+        if re.match(pattern, text):
+            # Check if it's a date first
+            if re.match(r'^\d{4}[/-]\d{1,2}[/-]\d{1,2}$', text) or \
+               re.match(r'^\d{1,2}[/-]\d{1,2}[/-]\d{4}$', text):
+                return {
+                    'content_type': 'date',
+                    'suspicion_multiplier': 1.0,  # Dates are less suspicious
+                    'details': 'Date'
+                }
+            return {
+                'content_type': 'number',
+                'suspicion_multiplier': 2.0,  # Suspicious if number is misaligned
+                'details': 'Numeric value or ID'
             }
 
-            pairs.append({
-                'label': label_text,
-                'value': value_text,
-                'label_bbox': label_bbox,
-                'value_bbox': value_bbox,
-                'spacing': spacing,
-                'full_text': text,
-                'full_bbox': bbox
-            })
+    # Name detection (title case with multiple words)
+    # Names typically have:
+    # - Title case (first letter capitalized)
+    # - 2-4 words
+    # - Mostly alphabetic characters
+    words = text.split()
+    if len(words) >= 2 and len(words) <= 5:
+        # Check if all words are title case and mostly alphabetic
+        is_title_case = all(
+            word[0].isupper() and word[1:].islower() if len(word) > 1 else word.isupper()
+            for word in words if word.isalpha()
+        )
+        is_mostly_alpha = sum(1 for w in words if w.isalpha()) >= len(words) * 0.8
 
-    return pairs
+        if is_title_case and is_mostly_alpha:
+            return {
+                'content_type': 'name',
+                'suspicion_multiplier': 3.0,  # VERY suspicious if name is misaligned
+                'details': 'Likely a person name'
+            }
 
-
-def is_excluded_colon(text: str) -> bool:
-    """
-    Check if text contains a colon that should be excluded (time, date, URL, ratio).
-    """
-    import re
-
-    # Time patterns: HH:MM or HH:MM:SS
-    if re.search(r'\d{1,2}:\d{2}(:\d{2})?', text):
-        return True
-
-    # URL patterns: http://, https://, mailto:
-    if re.search(r'(https?|mailto|ftp):', text, re.IGNORECASE):
-        return True
-
-    # Ratio patterns: N:M (e.g., 16:9, 4:3)
-    if re.search(r'\b\d+:\d+\b', text):
-        return True
-
-    return False
-
-
-def is_excluded_value(text: str) -> bool:
-    """
-    Check if a value text should be excluded from colon pattern analysis.
-    Excludes dates, times, URLs, etc.
-    """
-    import re
-
-    # Date patterns: YYYY/MM/DD, DD/MM/YYYY, YYYY-MM-DD
-    if re.search(r'\d{4}[/-]\d{1,2}[/-]\d{1,2}', text):
-        return True
-    if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{4}', text):
-        return True
-
-    # Time patterns: HH:MM or HH:MM:SS
-    if re.search(r'\d{1,2}:\d{2}(:\d{2})?', text):
-        return True
-
-    # URL patterns
-    if re.search(r'(https?|mailto|ftp)://', text, re.IGNORECASE):
-        return True
-
-    return False
-
-
-def analyze_colon_spacing(pairs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Analyze spacing patterns in colon pairs to find dominant spacing.
-
-    Returns:
-        Dict with dominant_spacing and cluster_info, or None if insufficient data
-    """
-    if len(pairs) < COLON_MIN_CLUSTER_SIZE:
-        return None
-
-    # Collect all spacing values
-    spacings = [p['spacing'] for p in pairs]
-
-    # Bucket spacings at 0.5pt precision
-    spacing_buckets: Dict[float, List[float]] = defaultdict(list)
-    for spacing in spacings:
-        bucket_key = round(spacing * 2) / 2  # Round to nearest 0.5pt
-        spacing_buckets[bucket_key].append(spacing)
-
-    # Find dominant cluster (most frequent)
-    if not spacing_buckets:
-        return None
-
-    dominant_bucket, dominant_items = max(
-        spacing_buckets.items(),
-        key=lambda kv: len(kv[1])
-    )
-
-    # Require minimum cluster size
-    if len(dominant_items) < COLON_MIN_CLUSTER_SIZE:
-        return None
-
-    # Calculate mean spacing for dominant cluster
-    dominant_spacing = sum(dominant_items) / len(dominant_items)
-
+    # Default to text
     return {
-        'dominant_spacing': dominant_spacing,
-        'dominant_count': len(dominant_items),
-        'total_pairs': len(pairs)
+        'content_type': 'text',
+        'suspicion_multiplier': 1.0,
+        'details': 'Text value'
     }
 
 
-def detect_right_aligned_values(pairs: List[Dict[str, Any]]) -> set:
+# Set of common English terms used to downgrade misalignment suspicion when
+# the detected text does not resemble a proper noun, number, date, or currency.
+# These include generic document labels that frequently appear in statements,
+# payslips, invoices, etc. Words should remain lowercase for normalization.
+COMMON_ENGLISH_WORDS: Set[str] = {
+    'a', 'an', 'and', 'at', 'by', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'with',
+    'account', 'accounts', 'accrual', 'adjustment', 'allocation', 'amount', 'amounts', 'analysis',
+    'balance', 'balances', 'bank', 'category', 'charge', 'charges', 'closing', 'column', 'columns',
+    'code', 'contact', 'credit', 'current', 'debit', 'deduction', 'deductions', 'department',
+    'description', 'detail', 'details', 'document', 'due', 'earnings', 'email', 'employee',
+    'employees', 'expenses', 'fee', 'fees', 'floor', 'footer', 'grand', 'header', 'hours',
+    'information', 'invoice', 'item', 'items', 'job', 'known', 'leave', 'line', 'lines', 'memo',
+    'message', 'method', 'month', 'note', 'notes', 'opening', 'outstanding', 'overview',
+    'page', 'pay', 'payment', 'period', 'permanent', 'previous', 'rate', 'reason', 'reference',
+    'remarks', 'report', 'row', 'rows', 'salary', 'schedule', 'section', 'service', 'slip',
+    'statement', 'status', 'subtotal', 'summary', 'support', 'switch', 'table', 'tax',
+    'title', 'total', 'totals', 'type', 'unit', 'units', 'value', 'year'
+}
+
+
+def is_common_english_phrase(text: str) -> bool:
     """
-    Detect which value bboxes are right-aligned (exception to spacing rules).
-
-    Returns:
-        Set of indices of right-aligned pairs
+    Determine whether the supplied text is composed entirely of common English
+    words (ignoring punctuation). Used to add counter evidence for low-risk
+    misalignment detections.
     """
-    if len(pairs) < 2:  # Reduced from 3 to 2 for better detection
-        return set()
+    import re
 
-    # Cluster right edges at 1.5pt precision (increased from 0.5pt for better tolerance)
-    right_edge_buckets: Dict[float, List[int]] = defaultdict(list)
+    if not text:
+        return False
 
-    for idx, pair in enumerate(pairs):
-        right_edge = pair['value_bbox']['x1']
-        bucket_key = round(right_edge * 0.67) / 0.67  # Round to nearest 1.5pt (1/0.67 ≈ 1.5)
-        right_edge_buckets[bucket_key].append(idx)
+    words = re.findall(r"[A-Za-z]+", text.lower())
+    if not words:
+        return False
 
-    # Find clusters with ≥2 items (reduced from ≥3 for better detection)
-    right_aligned_indices = set()
-    for bucket_key, indices in right_edge_buckets.items():
-        if len(indices) >= 2:  # Reduced from 3 to 2 for better detection
-            right_aligned_indices.update(indices)
-
-    return right_aligned_indices
+    # Require that every token be recognised as common; this keeps addresses
+    return all(word in COMMON_ENGLISH_WORDS for word in words)
 
 
 def calculate_iou(bbox1: Dict, bbox2: Dict) -> float:
@@ -2692,116 +3221,36 @@ def find_overlapping_pairs_optimized(
     cell_h: float = None,
 ) -> List[Tuple[int, int, float]]:
     """
-    Find overlapping cell pairs using spatial grid optimization.
-
-    Reduces complexity from O(n²) to ~O(9cn) where c = avg cells per grid cell.
-
-    Args:
-        cells: List of cell dictionaries with 'rect' key containing bbox
-        threshold: Minimum IoU threshold (default 0.25 = 25% overlap)
-        cell_w: Grid cell width (auto-calculated from median if None)
-        cell_h: Grid cell height (auto-calculated from median if None)
-
-    Returns:
-        List of (i, j, iou_score) tuples where i < j and iou_score >= threshold
+    Find overlapping cell pairs using the shared spatial grid optimization.
     """
-    from collections import defaultdict
-    from statistics import median
-
-    n = len(cells)
-    if n == 0:
+    if not cells:
         return []
 
-    # Extract all bboxes and convert to (x_min, y_min, x_max, y_max) format
-    bboxes = []
-    for cell in cells:
-        rect = cell.get('rect', {})
+    boxes: List[Tuple[float, float, float, float]] = []
+    valid_indices: List[int] = []
+
+    for idx, cell in enumerate(cells):
+        rect = cell.get("rect") or cell.get("bbox")
+        if not rect:
+            continue
         try:
             x_min, y_min, x_max, y_max = extract_bbox_coords(rect)
-            bboxes.append((x_min, y_min, x_max, y_max))
-        except:
-            # Skip cells with invalid bboxes
-            bboxes.append(None)
+        except Exception:
+            continue
+        boxes.append((x_min, y_min, x_max, y_max))
+        valid_indices.append(idx)
 
-    # Filter out None bboxes
-    valid_indices = [i for i, bbox in enumerate(bboxes) if bbox is not None]
-    valid_bboxes = [bboxes[i] for i in valid_indices]
-
-    if len(valid_bboxes) == 0:
+    if not boxes:
         return []
 
-    # Calculate widths/heights; use median for cell size (robust to outliers)
-    widths = [max(1e-9, b[2] - b[0]) for b in valid_bboxes]
-    heights = [max(1e-9, b[3] - b[1]) for b in valid_bboxes]
-    cw = cell_w or max(1e-9, median(widths))
-    ch = cell_h or max(1e-9, median(heights))
+    grid = SpatialGrid(boxes, cell_w=cell_w, cell_h=cell_h)
+    overlaps = grid.overlapping_pairs(threshold=threshold, mode="iou")
 
-    # Global bounds to anchor grid indexing
-    minx = min(b[0] for b in valid_bboxes)
-    miny = min(b[1] for b in valid_bboxes)
-
-    def cell_range_for_box(bbox):
-        """Get inclusive cell indices touched by the box"""
-        x0i = int((bbox[0] - minx) // cw)
-        x1i = int((bbox[2] - minx) // cw)
-        y0i = int((bbox[1] - miny) // ch)
-        y1i = int((bbox[3] - miny) // ch)
-        return x0i, x1i, y0i, y1i
-
-    # Map cells -> indices of boxes that touch them
-    grid = defaultdict(list)
-    cell_ranges = []
-    for local_idx, bbox in enumerate(valid_bboxes):
-        xr = cell_range_for_box(bbox)
-        cell_ranges.append(xr)
-        x0i, x1i, y0i, y1i = xr
-        for xi in range(x0i, x1i + 1):
-            for yi in range(y0i, y1i + 1):
-                grid[(xi, yi)].append(local_idx)
-
-    results = []
-    seen = set()  # avoid duplicate pairs
-
-    # For each box, check only its cell + 8 neighbors
-    neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)]
-
-    for local_i, bbox_i in enumerate(valid_bboxes):
-        x0i, x1i, y0i, y1i = cell_ranges[local_i]
-
-        # Collect candidate indices from this cell + neighbors
-        cand_idxs = set()
-        for xi in range(x0i, x1i + 1):
-            for yi in range(y0i, y1i + 1):
-                for dx, dy in neighbors:
-                    cand_idxs.update(grid.get((xi + dx, yi + dy), []))
-
-        for local_j in cand_idxs:
-            if local_j <= local_i:  # upper triangle only
-                continue
-
-            key = (local_i, local_j)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            bbox_j = valid_bboxes[local_j]
-
-            # Quick 1D projection reject: if no 1D overlap in x or y, skip
-            if bbox_i[2] <= bbox_j[0] or bbox_j[2] <= bbox_i[0]:  # no x-overlap
-                continue
-            if bbox_i[3] <= bbox_j[1] or bbox_j[3] <= bbox_i[1]:  # no y-overlap
-                continue
-
-            # Calculate IoU using existing function
-            cell_i_rect = cells[valid_indices[local_i]].get('rect', {})
-            cell_j_rect = cells[valid_indices[local_j]].get('rect', {})
-            iou = calculate_iou(cell_i_rect, cell_j_rect)
-
-            if iou >= threshold:
-                # Map back to original indices
-                orig_i = valid_indices[local_i]
-                orig_j = valid_indices[local_j]
-                results.append((orig_i, orig_j, iou))
+    results: List[Tuple[int, int, float]] = []
+    for local_i, local_j, score in overlaps:
+        orig_i = valid_indices[local_i]
+        orig_j = valid_indices[local_j]
+        results.append((orig_i, orig_j, score))
 
     return results
 
@@ -3542,6 +3991,449 @@ def generate_pikepdf_payload(pdf_path: Path, force_regenerate: bool = False) -> 
 
     except Exception as e:
         return False, f"Error generating pikepdf payload: {str(e)}", None
+
+
+# =============================================================================
+# PDFPlumber Payload Generation
+# =============================================================================
+
+def get_pdfplumber_chars_payload_path(pdf_path: Path) -> Path:
+    """Get the path where the PDFPlumber character-level payload should be saved."""
+    doc_name = pdf_path.stem
+    return PDFPLUMBER_CHARS_PAYLOADS_PATH / f"{doc_name}_pdfplumber_chars.json"
+
+
+def get_pdfplumber_words_payload_path(pdf_path: Path) -> Path:
+    """Get the path where the PDFPlumber word-level payload should be saved."""
+    doc_name = pdf_path.stem
+    return PDFPLUMBER_WORDS_PAYLOADS_PATH / f"{doc_name}_pdfplumber_words.json"
+
+
+def check_pdfplumber_chars_payload_exists(pdf_path: Path) -> Tuple[bool, Optional[Path], Optional[Dict]]:
+    """Check if a PDFPlumber character-level payload exists."""
+    payload_path = get_pdfplumber_chars_payload_path(pdf_path)
+
+    if not payload_path.exists():
+        return False, None, None
+
+    try:
+        with open(payload_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        metadata = data.get("metadata", {})
+        file_size_kb = payload_path.stat().st_size / 1024
+
+        metadata_info = {
+            "file_size_kb": file_size_kb,
+            "generation_time": metadata.get("generation_time", "Unknown"),
+            "num_pages": len(data.get("pages", []))
+        }
+
+        return True, payload_path, metadata_info
+    except Exception:
+        return True, payload_path, None
+
+
+def check_pdfplumber_words_payload_exists(pdf_path: Path) -> Tuple[bool, Optional[Path], Optional[Dict]]:
+    """Check if a PDFPlumber word-level payload exists."""
+    payload_path = get_pdfplumber_words_payload_path(pdf_path)
+
+    if not payload_path.exists():
+        return False, None, None
+
+    try:
+        with open(payload_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        metadata = data.get("metadata", {})
+        file_size_kb = payload_path.stat().st_size / 1024
+
+        metadata_info = {
+            "file_size_kb": file_size_kb,
+            "generation_time": metadata.get("generation_time", "Unknown"),
+            "num_pages": len(data.get("pages", []))
+        }
+
+        return True, payload_path, metadata_info
+    except Exception:
+        return True, payload_path, None
+
+
+def generate_pdfplumber_chars_payload(pdf_path: Path, force_regenerate: bool = False) -> Tuple[bool, str, Optional[Path]]:
+    """
+    Generate PDFPlumber character-level payload for the PDF.
+
+    Args:
+        pdf_path: Path to the PDF file
+        force_regenerate: If True, regenerate even if payload exists
+
+    Returns:
+        Tuple of (success, message, payload_path)
+    """
+    if not HAS_PDFPLUMBER:
+        return False, "PDFPlumber is not installed", None
+
+    payload_path = get_pdfplumber_chars_payload_path(pdf_path)
+
+    # Check if payload already exists
+    if not force_regenerate and payload_path.exists():
+        file_size_kb = payload_path.stat().st_size / 1024
+        return True, f"PDFPlumber character-level payload already exists ({file_size_kb:.1f} KB)", payload_path
+
+    def make_serializable(obj):
+        """Convert PDFPlumber objects to JSON-serializable format."""
+        if obj is None:
+            return None
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [make_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {str(k): make_serializable(v) for k, v in obj.items()}
+        elif hasattr(obj, '__dict__'):
+            # Convert objects with __dict__ to dictionaries
+            return {str(k): make_serializable(v) for k, v in obj.__dict__.items()}
+        else:
+            # Convert other objects to string representation
+            return str(obj)
+
+    try:
+        start_time = time.time()
+
+        # Create output folder if it doesn't exist
+        payload_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Extract data using PDFPlumber
+        pages_data = []
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                # Extract data and make it serializable
+                page_data = {
+                    "page_number": page_num,
+                    "width": float(page.width) if page.width else None,
+                    "height": float(page.height) if page.height else None,
+                    "rotation": int(page.rotation) if page.rotation else 0,
+                    "chars": make_serializable(page.chars) if page.chars else [],
+                    "lines": make_serializable(page.lines) if page.lines else [],
+                    "rects": make_serializable(page.rects) if page.rects else [],
+                    "curves": make_serializable(page.curves) if page.curves else [],
+                    "images": make_serializable(page.images) if page.images else [],
+                    "text": page.extract_text() or "",
+                    "words": make_serializable(page.extract_words()) if page.extract_words() else []
+                }
+                pages_data.append(page_data)
+
+        # Build payload
+        payload = {
+            "source_file": str(pdf_path.name),
+            "metadata": {
+                "generation_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "generator": "PDFPlumber",
+                "payload_type": "character-level",
+                "pdfplumber_version": getattr(pdfplumber, '__version__', 'unknown')
+            },
+            "pages": pages_data
+        }
+
+        # Save payload
+        with open(payload_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        elapsed_time = time.time() - start_time
+        file_size_kb = payload_path.stat().st_size / 1024
+        message = f"PDFPlumber character-level payload generated in {elapsed_time:.1f}s ({file_size_kb:.1f} KB)"
+        return True, message, payload_path
+
+    except Exception as e:
+        return False, f"Error generating PDFPlumber character-level payload: {str(e)}", None
+
+
+def generate_pdfplumber_words_payload(pdf_path: Path, force_regenerate: bool = False) -> Tuple[bool, str, Optional[Path]]:
+    """
+    Generate PDFPlumber word-level payload for the PDF.
+
+    Args:
+        pdf_path: Path to the PDF file
+        force_regenerate: If True, regenerate even if payload exists
+
+    Returns:
+        Tuple of (success, message, payload_path)
+    """
+    if not HAS_PDFPLUMBER:
+        return False, "PDFPlumber is not installed", None
+
+    payload_path = get_pdfplumber_words_payload_path(pdf_path)
+
+    # Check if payload already exists
+    if not force_regenerate and payload_path.exists():
+        file_size_kb = payload_path.stat().st_size / 1024
+        return True, f"PDFPlumber word-level payload already exists ({file_size_kb:.1f} KB)", payload_path
+
+    def make_serializable(obj):
+        """Convert PDFPlumber objects to JSON-serializable format."""
+        if obj is None:
+            return None
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [make_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {str(k): make_serializable(v) for k, v in obj.items()}
+        elif hasattr(obj, '__dict__'):
+            # Convert objects with __dict__ to dictionaries
+            return {str(k): make_serializable(v) for k, v in obj.__dict__.items()}
+        else:
+            # Convert other objects to string representation
+            return str(obj)
+
+    try:
+        start_time = time.time()
+
+        # Create output folder if it doesn't exist
+        payload_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Extract data using PDFPlumber
+        pages_data = []
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                # Extract word-level data with font information
+                words_with_fonts = make_serializable(
+                    page.extract_words(extra_attrs=["fontname", "size"])
+                ) if page.extract_words(extra_attrs=["fontname", "size"]) else []
+
+                # Extract table data
+                tables = []
+                try:
+                    extracted_tables = page.extract_tables()
+                    if extracted_tables:
+                        for table_idx, table in enumerate(extracted_tables):
+                            tables.append({
+                                "table_index": table_idx,
+                                "data": make_serializable(table)
+                            })
+                except Exception:
+                    # If table extraction fails, continue without tables
+                    pass
+
+                page_data = {
+                    "page_number": page_num,
+                    "width": float(page.width) if page.width else None,
+                    "height": float(page.height) if page.height else None,
+                    "rotation": int(page.rotation) if page.rotation else 0,
+                    "words": words_with_fonts,
+                    "tables": tables,
+                    "text": page.extract_text() or ""
+                }
+                pages_data.append(page_data)
+
+        # Build payload
+        payload = {
+            "source_file": str(pdf_path.name),
+            "metadata": {
+                "generation_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "generator": "PDFPlumber",
+                "payload_type": "word-level",
+                "pdfplumber_version": getattr(pdfplumber, '__version__', 'unknown')
+            },
+            "pages": pages_data
+        }
+
+        # Save payload
+        with open(payload_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        elapsed_time = time.time() - start_time
+        file_size_kb = payload_path.stat().st_size / 1024
+        message = f"PDFPlumber word-level payload generated in {elapsed_time:.1f}s ({file_size_kb:.1f} KB)"
+        return True, message, payload_path
+
+    except Exception as e:
+        return False, f"Error generating PDFPlumber word-level payload: {str(e)}", None
+
+
+# =============================================================================
+# PyMuPDF Payload Generation
+# =============================================================================
+
+def get_pymupdf_payload_path(pdf_path: Path) -> Path:
+    """Get the path where the PyMuPDF payload should be saved."""
+    doc_name = pdf_path.stem
+    return PYMUPDF_PAYLOADS_PATH / f"{doc_name}_pymupdf_payload.json"
+
+
+def check_pymupdf_payload_exists(pdf_path: Path) -> Tuple[bool, Optional[Path], Optional[Dict]]:
+    """
+    Check if a PyMuPDF payload already exists for the PDF.
+
+    Returns:
+        Tuple of (exists, path, metadata_dict)
+    """
+    payload_path = get_pymupdf_payload_path(pdf_path)
+
+    if not payload_path.exists():
+        return False, None, None
+
+    # Load metadata
+    try:
+        with open(payload_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        metadata = data.get("metadata", {})
+        file_size_kb = payload_path.stat().st_size / 1024
+
+        metadata_info = {
+            "file_size_kb": file_size_kb,
+            "generation_time": metadata.get("generation_time", "Unknown"),
+            "num_pages": len(data.get("pages", []))
+        }
+
+        return True, payload_path, metadata_info
+    except Exception:
+        return True, payload_path, None
+
+
+def generate_pymupdf_payload(pdf_path: Path, force_regenerate: bool = False) -> Tuple[bool, str, Optional[Path]]:
+    """
+    Generate PyMuPDF (fitz) payload for the PDF.
+
+    Args:
+        pdf_path: Path to the PDF file
+        force_regenerate: If True, regenerate even if payload exists
+
+    Returns:
+        Tuple of (success, message, payload_path)
+    """
+    payload_path = get_pymupdf_payload_path(pdf_path)
+
+    # Check if payload already exists
+    if not force_regenerate and payload_path.exists():
+        file_size_kb = payload_path.stat().st_size / 1024
+        return True, f"PyMuPDF payload already exists ({file_size_kb:.1f} KB)", payload_path
+
+    def make_serializable(obj):
+        """Convert PyMuPDF objects to JSON-serializable format."""
+        if obj is None:
+            return None
+        elif isinstance(obj, bytes):
+            # Decode bytes to string, or represent as base64 if binary
+            try:
+                return obj.decode('utf-8')
+            except UnicodeDecodeError:
+                import base64
+                return base64.b64encode(obj).decode('utf-8')
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [make_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {str(k): make_serializable(v) for k, v in obj.items()}
+        elif hasattr(obj, '__dict__'):
+            # Convert objects with __dict__ to dictionaries
+            return {str(k): make_serializable(v) for k, v in obj.__dict__.items()}
+        elif isinstance(obj, fitz.Rect):
+            # Handle fitz.Rect objects
+            return {
+                "x0": obj.x0,
+                "y0": obj.y0,
+                "x1": obj.x1,
+                "y1": obj.y1
+            }
+        elif isinstance(obj, fitz.Point):
+            # Handle fitz.Point objects
+            return {"x": obj.x, "y": obj.y}
+        else:
+            # Convert other objects to string representation
+            return str(obj)
+
+    try:
+        start_time = time.time()
+
+        # Create output folder if it doesn't exist
+        payload_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Extract data using PyMuPDF (fitz)
+        pages_data = []
+
+        doc = fitz.open(pdf_path)
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+
+            # Get page dimensions
+            rect = page.rect
+
+            # Extract text with detailed information
+            text_dict = page.get_text("dict")
+
+            # Extract text blocks
+            text_blocks = page.get_text("blocks")
+
+            # Extract text as plain text
+            text = page.get_text()
+
+            # Extract words with bounding boxes
+            words = page.get_text("words")
+
+            # Get images
+            image_list = page.get_images()
+
+            # Get links
+            links = page.get_links()
+
+            # Get drawings/paths
+            drawings = page.get_drawings()
+
+            page_data = {
+                "page_number": page_num + 1,
+                "width": float(rect.width),
+                "height": float(rect.height),
+                "rotation": int(page.rotation),
+                "text": text or "",
+                "text_dict": make_serializable(text_dict),
+                "text_blocks": make_serializable(text_blocks),
+                "words": make_serializable(words),
+                "images": [
+                    {
+                        "xref": int(img[0]),
+                        "smask": int(img[1]) if img[1] else None,
+                        "width": int(img[2]),
+                        "height": int(img[3]),
+                        "bpc": int(img[4]),
+                        "colorspace": str(img[5]),
+                        "name": str(img[7])
+                    } for img in image_list
+                ],
+                "links": make_serializable(links),
+                "drawings": make_serializable(drawings)
+            }
+            pages_data.append(page_data)
+
+        doc.close()
+
+        # Build payload
+        payload = {
+            "source_file": str(pdf_path.name),
+            "metadata": {
+                "generation_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "generator": "PyMuPDF",
+                "pymupdf_version": fitz.__version__ if hasattr(fitz, '__version__') else 'unknown'
+            },
+            "pages": pages_data
+        }
+
+        # Save payload
+        with open(payload_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        elapsed_time = time.time() - start_time
+        file_size_kb = payload_path.stat().st_size / 1024
+        message = f"PyMuPDF payload generated in {elapsed_time:.1f}s ({file_size_kb:.1f} KB)"
+        return True, message, payload_path
+
+    except Exception as e:
+        return False, f"Error generating PyMuPDF payload: {str(e)}", None
 
 
 def generate_adobe_payload(pdf_path: Path, force_regenerate: bool = False) -> Tuple[bool, str, Optional[Path]]:
@@ -4637,6 +5529,23 @@ def detect_hidden_text(pdf_path: Path, payload_path: Path, reuse_visible_payload
 
         text_not_visible_output = text_not_visible_filtered if SHOW_TEXT_NOT_RENDERED else []
 
+        # Filter out items with unknown/invalid text (e.g., "<unknown>")
+        def is_valid_text(text: str) -> bool:
+            """Check if text is valid (not unknown, empty, or placeholder)"""
+            if not text:
+                return False
+            text_stripped = text.strip()
+            if not text_stripped:
+                return False
+            # Exclude common unknown/placeholder patterns
+            if text_stripped in ("<unknown>", "unknown", "<none>", "None"):
+                return False
+            return True
+
+        # Filter both types of hidden items
+        hidden_text_items = [item for item in hidden_text_items if is_valid_text(item.get('text', ''))]
+        text_not_visible_output = [item for item in text_not_visible_output if is_valid_text(item.get('text', ''))]
+
         # Combine all hidden text
         all_hidden_items = hidden_text_items + text_not_visible_output
         total_hidden_count = len(all_hidden_items)
@@ -4751,6 +5660,26 @@ BASELINE_THRESHOLD_COUNT = 4
 BASELINE_THRESHOLD_PERCENTAGE = 2.0
 PER_PAGE_RARE_COUNT = 5
 
+NUMERIC_VALUE_PATTERN = re.compile(
+    r"""^\s*
+        (?:[Rr]\s*)?                # optional Rand currency
+        [\+\-\(\)]*                 # optional signs/parentheses
+        [0-9][0-9\s,\.]*            # digits with thousands separators/decimals
+        (?:\s*(?:Cr|Dr))?           # optional credit/debit suffix
+        \s*$""",
+    re.VERBOSE,
+)
+
+
+def _is_probably_numeric_value(text: Optional[str]) -> bool:
+    """Heuristic to determine if a cell value looks like a numeric amount."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(NUMERIC_VALUE_PATTERN.match(stripped))
+
 
 def identify_rare_font_properties(
     analysis: Dict,
@@ -4829,6 +5758,10 @@ def render_pdf_with_annotations(
     alignment_anomalies: List[Dict[str, Any]] = None,
     alignment_baselines: List[Dict[str, Any]] = None,
     colon_spacing_items: List[Dict[str, Any]] = None,
+    text_blocks: List[Dict[str, Any]] = None,
+    selection_highlights: List[Dict[str, Any]] = None,
+    horizontal_alignment_items: List[Dict[str, Any]] = None,
+    vertical_alignment_items: List[Dict[str, Any]] = None,
     dpi: int = 150
 ) -> Optional[Image.Image]:
     """
@@ -4844,7 +5777,9 @@ def render_pdf_with_annotations(
         docling_table_cells: Table cell bounding boxes extracted from Docling payload
         alignment_anomalies: Detected label/value misalignment items
         alignment_baselines: Detected alignment baselines for visualization
+        text_blocks: Identified text blocks with spacing statistics
         colon_spacing_items: Detected colon spacing patterns (green/red/orange)
+        selection_highlights: Lightweight, ad-hoc highlights for contextual viewers
         dpi: DPI for rendering (default 150)
 
     Returns:
@@ -4884,7 +5819,11 @@ def render_pdf_with_annotations(
             'has_clip': (255, 192, 203, 60), # Pink
             'text_size': (255, 140, 0, 60),  # Dark Orange
             'line_height': (139, 69, 19, 60), # Brown
-            'docling_alignment': (255, 20, 147, 90)  # Deep pink - alignment anomalies
+            'docling_alignment': (255, 20, 147, 90),  # Deep pink - alignment anomalies
+            'horizontal_misalignment': (255, 0, 0, 90),  # Bright red - high risk misalignment
+            'horizontal_misalignment_low_risk': (255, 200, 120, 90),  # Light orange - counter evidence
+            'vertical_alignment_deviation': (30, 144, 255, 110),  # Dodger blue - column misalignment
+            'text_block': (138, 43, 226, 60)  # Blue-violet - text block overlay
         }
         hidden_underlay_outline = (30, 144, 255, 255)  # Dodger blue
         hidden_underlay_fill = (30, 144, 255, 60)
@@ -4962,6 +5901,50 @@ def render_pdf_with_annotations(
                     except Exception:
                         pass
 
+        # Draw ad-hoc selection highlights (Font Analysis drill-down viewer)
+        if selection_highlights:
+            default_selection_color = (64, 224, 208, 90)
+            for highlight in selection_highlights:
+                if highlight.get('page') != page_num:
+                    continue
+
+                bbox = highlight.get('bbox')
+                if not bbox:
+                    continue
+
+                try:
+                    x0, y0, x1, y1 = _sorted_coords(
+                        bbox.get('x0', 0),
+                        bbox.get('y0', 0),
+                        bbox.get('x1', 0),
+                        bbox.get('y1', 0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                color = highlight.get('color') or default_selection_color
+                if len(color) == 3:
+                    color = tuple(list(color) + [90])
+
+                px0 = int(x0 * scale_x)
+                px1 = int(x1 * scale_x)
+
+                # Check source and flip y-coordinates for Adobe (bottom-left origin)
+                source = highlight.get('source', 'docling')
+                if source in ('adobe', 'pikepdf') and pdf_height:
+                    # Adobe/pikepdf coordinates use bottom-left origin; convert to image top-left
+                    py0 = int((pdf_height - y1) * scale_y)
+                    py1 = int((pdf_height - y0) * scale_y)
+                else:
+                    py0 = int(y0 * scale_y)
+                    py1 = int(y1 * scale_y)
+
+                outline_color = (color[0], color[1], color[2], 255)
+                draw.rectangle([px0, py0, px1, py1], fill=color, outline=outline_color, width=3)
+
+                if 'selection_highlight' not in annotations:
+                    annotations.append('selection_highlight')
+
         # Helper function to draw bounding boxes for rare properties
         def draw_rare_property_bboxes(rare_props: Dict, source: str):
             for prop_name, rare_values in rare_props.items():
@@ -4975,7 +5958,6 @@ def render_pdf_with_annotations(
                         if item.get('page') != page_num:
                             continue
 
-                        # Get bbox - Adobe/pikepdf payloads have BBox key
                         bbox = item.get('BBox')
                         if not bbox:
                             continue
@@ -4988,13 +5970,17 @@ def render_pdf_with_annotations(
                                 bbox.get('y1', 0)
                             )
 
-                            # Scale to image coordinates
                             px0 = int(x0 * scale_x)
-                            py0 = int(y0 * scale_y)
                             px1 = int(x1 * scale_x)
-                            py1 = int(y1 * scale_y)
 
-                            # Draw filled rectangle
+                            if pdf_height:
+                                # Adobe coordinates use bottom-left origin; convert to image top-left
+                                py0 = int((pdf_height - y1) * scale_y)
+                                py1 = int((pdf_height - y0) * scale_y)
+                            else:
+                                py0 = int(y0 * scale_y)
+                                py1 = int(y1 * scale_y)
+
                             outline_color = tuple(list(color[:3]) + [255])
                             draw.rectangle([px0, py0, px1, py1], fill=color, outline=outline_color, width=2)
 
@@ -5042,9 +6028,6 @@ def render_pdf_with_annotations(
 
         # Draw Docling alignment anomalies
         if alignment_anomalies:
-            fill_color = colors['docling_alignment']
-            outline_color = (fill_color[0], fill_color[1], fill_color[2], 255)
-
             for item in alignment_anomalies:
                 if item.get('page') != page_num:
                     continue
@@ -5063,13 +6046,86 @@ def render_pdf_with_annotations(
                 except (TypeError, ValueError):
                     continue
 
+                classification = item.get('classification')
+                if classification and classification.startswith('horizontal_misalignment'):
+                    fill_color = colors.get(classification, colors['horizontal_misalignment'])
+                else:
+                    fill_color = colors['docling_alignment']
+
+                outline_color = (fill_color[0], fill_color[1], fill_color[2], 255)
+
                 px0 = int(x0 * scale_x)
                 py0 = int(y0 * scale_y)
                 px1 = int(x1 * scale_x)
                 py1 = int(y1 * scale_y)
 
                 draw.rectangle([px0, py0, px1, py1], fill=fill_color, outline=outline_color, width=3)
-                annotations.append('docling_alignment')
+                annotations.append(classification or 'docling_alignment')
+
+        # Draw vertical alignment anomalies (blue)
+        if vertical_alignment_items:
+            for item in vertical_alignment_items:
+                if item.get('page') != page_num:
+                    continue
+
+                bbox = item.get('bbox', {})
+                if not bbox:
+                    continue
+
+                try:
+                    x0, y0, x1, y1 = _sorted_coords(
+                        bbox.get('x0', 0),
+                        bbox.get('y0', 0),
+                        bbox.get('x1', 0),
+                        bbox.get('y1', 0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                # Vertical alignment items come from Docling which uses top-left origin
+                # Do NOT flip y-coordinates (unlike Adobe/pikepdf data)
+                px0 = int(x0 * scale_x)
+                px1 = int(x1 * scale_x)
+                py0 = int(y0 * scale_y)
+                py1 = int(y1 * scale_y)
+
+                fill_color = (30, 144, 255, 90)
+                outline_color = (30, 144, 255, 220)
+                draw.rectangle([px0, py0, px1, py1], fill=fill_color, outline=outline_color, width=2)
+
+                if 'vertical_alignment_deviation' not in annotations:
+                    annotations.append('vertical_alignment_deviation')
+
+        # Draw identified text blocks (for spacing diagnostics)
+        if SHOW_TEXT_BLOCKS and text_blocks:
+            block_color = colors['text_block']
+            block_outline = (block_color[0], block_color[1], block_color[2], 220)
+            block_fill = (block_color[0], block_color[1], block_color[2], 40)
+
+            for block in text_blocks:
+                bbox = block.get('bbox', {})
+                if not bbox:
+                    continue
+
+                try:
+                    x0, y0, x1, y1 = _sorted_coords(
+                        bbox.get('x0', 0),
+                        bbox.get('y0', 0),
+                        bbox.get('x1', 0),
+                        bbox.get('y1', 0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                px0 = int(x0 * scale_x)
+                py0 = int(y0 * scale_y)
+                px1 = int(x1 * scale_x)
+                py1 = int(y1 * scale_y)
+
+                draw.rectangle([px0, py0, px1, py1], outline=block_outline, fill=block_fill, width=2)
+
+                if 'text_block' not in annotations:
+                    annotations.append('text_block')
 
         # Draw alignment baselines
         if alignment_baselines:
@@ -5096,27 +6152,82 @@ def render_pdf_with_annotations(
                         line_color = (0, 191, 255, 255)  # Deep sky blue - solid for page edges
                     else:
                         line_color = (0, 255, 255, 200)  # Cyan - semi-transparent for mid-page
+
+                    # Convert PDF x-coordinate to pixel coordinate
+                    px = int(value * scale_x)
+
+                    # Draw vertical line across the entire page height
+                    draw.line([(px, 0), (px, img_height)], fill=line_color, width=2)
+
+                    # Add label at the top of the page
+                    label_text = f"{orientation[0].upper()}: {value:.1f}pt ({count})"
+
+                    # Position label slightly offset from the line
+                    label_x = px + 5
+                    label_y = 10
+
                 elif orientation == 'right':
                     # Right-aligned baselines: orange/yellow shades
                     if page_position == 'page_right':
                         line_color = (255, 140, 0, 255)  # Dark orange - solid for page edges
                     else:
                         line_color = (255, 165, 0, 200)  # Orange - semi-transparent for mid-page
+
+                    # Convert PDF x-coordinate to pixel coordinate
+                    px = int(value * scale_x)
+
+                    # Draw vertical line across the entire page height
+                    draw.line([(px, 0), (px, img_height)], fill=line_color, width=2)
+
+                    # Add label at the top of the page
+                    label_text = f"{orientation[0].upper()}: {value:.1f}pt ({count})"
+
+                    # Position label slightly offset from the line
+                    label_x = px - 70
+                    label_y = 10
+
+                elif orientation == 'top':
+                    # Top-aligned baselines: purple shades
+                    if page_position == 'page_top':
+                        line_color = (148, 0, 211, 255)  # Dark violet - solid for page edges
+                    else:
+                        line_color = (186, 85, 211, 200)  # Medium orchid - semi-transparent for mid-page
+
+                    # Convert PDF y-coordinate to pixel coordinate
+                    py = int(value * scale_y)
+
+                    # Draw horizontal line across the entire page width
+                    draw.line([(0, py), (img_width, py)], fill=line_color, width=2)
+
+                    # Add label at the left of the page
+                    label_text = f"{orientation[0].upper()}: {value:.1f}pt ({count})"
+
+                    # Position label slightly offset from the line
+                    label_x = 10
+                    label_y = py + 5
+
+                elif orientation == 'bottom':
+                    # Bottom-aligned baselines: brown shades
+                    if page_position == 'page_bottom':
+                        line_color = (139, 69, 19, 255)  # Saddle brown - solid for page edges
+                    else:
+                        line_color = (165, 42, 42, 200)  # Brown - semi-transparent for mid-page
+
+                    # Convert PDF y-coordinate to pixel coordinate
+                    py = int(value * scale_y)
+
+                    # Draw horizontal line across the entire page width
+                    draw.line([(0, py), (img_width, py)], fill=line_color, width=2)
+
+                    # Add label at the left of the page
+                    label_text = f"{orientation[0].upper()}: {value:.1f}pt ({count})"
+
+                    # Position label slightly offset from the line
+                    label_x = 10
+                    label_y = py - 20
+
                 else:
                     continue
-
-                # Convert PDF x-coordinate to pixel coordinate
-                px = int(value * scale_x)
-
-                # Draw vertical line across the entire page height
-                draw.line([(px, 0), (px, img_height)], fill=line_color, width=2)
-
-                # Add label at the top of the page
-                label_text = f"{orientation[0].upper()}: {value:.1f}pt ({count})"
-
-                # Position label slightly offset from the line
-                label_x = px + 5 if orientation == 'left' else px - 70
-                label_y = 10
 
                 # Draw label background for readability
                 if font:
@@ -5201,7 +6312,11 @@ def build_annotation_details(
     rare_pikepdf_properties: Dict = None,
     adobe_analysis: Dict = None,
     pikepdf_analysis: Dict = None,
-    docling_alignment_items: List[Dict[str, Any]] = None
+    docling_alignment_items: List[Dict[str, Any]] = None,
+    colon_spacing_items: List[Dict[str, Any]] = None,
+    horizontal_alignment_items: List[Dict[str, Any]] = None,
+    vertical_alignment_items: List[Dict[str, Any]] = None,
+    text_blocks: List[Dict[str, Any]] = None
 ) -> List[Dict]:
     """
     Build detailed information about all annotated items on a page.
@@ -5220,7 +6335,14 @@ def build_annotation_details(
         'has_clip': ('#FFC0CB', 'Pink'),
         'text_size': ('#FF8C00', 'Dark Orange'),
         'line_height': ('#8B4513', 'Brown'),
-        'docling_alignment': ('#FF1493', 'Deep Pink')
+        'docling_alignment': ('#FF1493', 'Deep Pink'),
+        'colon_spacing_consistent': ('#00FF00', 'Green'),
+        'colon_spacing_deviation': ('#FF0000', 'Red'),
+        'colon_spacing_right_aligned': ('#FFA500', 'Orange'),
+        'horizontal_misalignment': ('#FF0000', 'Red'),
+        'horizontal_misalignment_low_risk': ('#FFC87C', 'Light Orange'),
+        'vertical_alignment_deviation': ('#1E90FF', 'Blue'),
+        'text_block': ('#8A2BE2', 'Blue Violet')
     }
 
     # Collect all annotated items by text+bbox
@@ -5358,6 +6480,10 @@ def build_annotation_details(
             if not bbox:
                 continue
 
+            reasons = item.get('reasons') or []
+            if not reasons:
+                continue
+
             bbox_key = str(bbox)
             key = (text, bbox_key)
 
@@ -5369,17 +6495,426 @@ def build_annotation_details(
                     'color_name': color_map['docling_alignment'][1]
                 }
 
-            for reason in item.get('reasons', []):
+            for reason in reasons:
                 annotations_map[key]['reasons'].append({
                     'type': reason.get('type', 'Alignment anomaly'),
                     'details': reason.get('details', '')
                 })
 
+    # Add colon spacing patterns
+    # ONLY show red (deviation) and orange (right_aligned) - skip green (consistent)
+    if colon_spacing_items:
+        for item in colon_spacing_items:
+            if item.get('page') != page_num:
+                continue
+
+            # Get classification - skip consistent (green) items
+            classification = item.get('classification', 'consistent')
+            if classification == 'consistent':
+                continue  # Don't display green items - only interested in red and orange
+
+            # Use the value text as the display text
+            text = item.get('value', '')
+            bbox = item.get('bbox', {})
+            if not bbox:
+                continue
+
+            bbox_key = str(bbox)
+            key = (text, bbox_key)
+
+            # Determine color
+            color_key = f'colon_spacing_{classification}'
+
+            if key not in annotations_map:
+                annotations_map[key] = {
+                    'text': text,
+                    'reasons': [],
+                    'color': color_map.get(color_key, ('#808080', 'Gray'))[0],
+                    'color_name': color_map.get(color_key, ('#808080', 'Gray'))[1],
+                    'font_info': item.get('font_info')  # Add font info
+                }
+
+            # Add the reason from the item
+            reason_text = item.get('reason', '')
+            label = item.get('label', '')
+
+            # Create detailed reason
+            reason_type = {
+                'deviation': 'Colon Spacing: DEVIATION (Suspicious)',
+                'right_aligned': 'Colon Spacing: Right-aligned'
+            }.get(classification, 'Colon Spacing')
+
+            annotations_map[key]['reasons'].append({
+                'type': reason_type,
+                'details': f"{label} → {text}\n{reason_text}"
+            })
+
+    # Add horizontal alignment anomalies
+    if horizontal_alignment_items:
+        for item in horizontal_alignment_items:
+            if item.get('page') != page_num:
+                continue
+
+            text = item.get('text', '')
+            bbox = item.get('bbox', {})
+            if not bbox:
+                continue
+
+            bbox_key = str(bbox)
+            key = (text, bbox_key)
+
+            # Determine color
+            classification = item.get('classification', 'horizontal_misalignment')
+            color_key = classification
+
+            if key not in annotations_map:
+                annotations_map[key] = {
+                    'text': text,
+                    'reasons': [],
+                    'color': color_map.get(color_key, ('#FF0000', 'Red'))[0],
+                    'color_name': color_map.get(color_key, ('#FF0000', 'Red'))[1],
+                    'font_info': item.get('font_info')  # Add font info
+                }
+
+            # Add the reason from the item
+            reason_text = item.get('reason', '')
+            details_text = item.get('details', '')
+
+            # Create detailed reason
+            if classification == 'horizontal_misalignment_low_risk' or item.get('severity') == 'low':
+                reason_type = 'Horizontal Alignment: MISALIGNMENT (Review)'
+            else:
+                reason_type = 'Horizontal Alignment: MISALIGNMENT (Suspicious)'
+
+            annotations_map[key]['reasons'].append({
+                'type': reason_type,
+                'details': f"{text}\n{details_text}"
+            })
+
+            counter_info = item.get('counter_evidence')
+            if counter_info:
+                annotations_map[key]['reasons'].append({
+                    'type': counter_info.get('title', 'Counter Evidence'),
+                    'details': counter_info.get('details', '')
+                })
+
+    # Add vertical alignment anomalies
+    if vertical_alignment_items:
+        for item in vertical_alignment_items:
+            if item.get('page') != page_num:
+                continue
+
+            text = item.get('text', '')
+            bbox = item.get('bbox', {})
+            if not bbox:
+                continue
+
+            bbox_key = str(bbox)
+            key = (text, bbox_key, 'vertical')
+
+            if key not in annotations_map:
+                annotations_map[key] = {
+                    'text': text,
+                    'reasons': [],
+                    'color': color_map['vertical_alignment_deviation'][0],
+                    'color_name': color_map['vertical_alignment_deviation'][1],
+                    'font_info': item.get('font_info')
+                }
+
+            reason_text = item.get('reason', '')
+            if reason_text:
+                annotations_map[key]['reasons'].append({
+                    'type': 'Vertical Alignment',
+                    'details': reason_text
+                })
+
+    # Add vertical alignment anomalies
+    if vertical_alignment_items:
+        for item in vertical_alignment_items:
+            if item.get('page') != page_num:
+                continue
+
+            text = item.get('text', '')
+            bbox = item.get('bbox', {})
+            if not bbox:
+                continue
+
+            bbox_key = str(bbox)
+            key = (text, bbox_key, 'vertical')
+
+            classification = item.get('classification', 'vertical_alignment_deviation')
+            color_key = classification
+
+            if key not in annotations_map:
+                annotations_map[key] = {
+                    'text': text,
+                    'reasons': [],
+                    'color': color_map.get(color_key, ('#1E90FF', 'Blue'))[0],
+                    'color_name': color_map.get(color_key, ('#1E90FF', 'Blue'))[1],
+                    'font_info': item.get('font_info')
+                }
+
+            reason_text = item.get('reason', '')
+            annotations_map[key]['reasons'].append({
+                'type': 'Vertical Alignment',
+                'details': reason_text
+            })
+
+    # NOTE: Text blocks are drawn as overlays in render_pdf_with_annotations,
+    # but they should NOT appear in the "Highlighted Items" section because
+    # that section is reserved for anomalies only, not informational overlays.
+    # Text blocks are not anomalies - they're just visual groupings for reference.
+
     # Convert to list and sort by text
-    annotations_list = list(annotations_map.values())
+    annotations_list = [item for item in annotations_map.values() if item.get('reasons')]
     annotations_list.sort(key=lambda x: x['text'])
 
     return annotations_list
+
+
+def render_font_property_selection_viewer(
+    pdf_path: Optional[Path],
+    prop_key: str,
+    property_label: str,
+    selected_value: Any,
+    value_label: Optional[str],
+    items: List[Dict[str, Any]],
+    source: str,
+    highlight_color: Optional[Tuple[int, int, int, int]] = None,
+    all_property_data: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> None:
+    """
+    Render a lightweight document viewer for the currently selected Font Analysis filter.
+
+    Args:
+        all_property_data: Dict mapping all values to their items (for "All categories" mode)
+    """
+    if not pdf_path:
+        return
+
+    pdf_obj = pdf_path if isinstance(pdf_path, Path) else Path(pdf_path)
+    if not pdf_obj.exists():
+        return
+
+    safe_value_fragment = "".join(ch if ch.isalnum() else "_" for ch in str(selected_value) if ch.isalnum())
+    widget_prefix = f"{source}_{prop_key}_{safe_value_fragment or 'none'}"
+
+    st.markdown("#### Document Viewer for Font Attributes")
+
+    # Add display mode option buttons (always visible)
+    display_mode = st.radio(
+        "Display mode:",
+        options=["Selected value only", "All categories"],
+        index=0,
+        key=f"{widget_prefix}_display_mode",
+        horizontal=True
+    )
+
+    # Prepare viewer items based on display mode
+    viewer_items_by_value: Dict[Any, List[Dict[str, Any]]] = {}
+
+    if display_mode == "All categories" and all_property_data:
+        # Show all categories with different colors
+        for value, value_items in all_property_data.items():
+            viewer_items_by_value[value] = []
+            for item in value_items:
+                page_value = item.get("page")
+                if page_value is None:
+                    continue
+
+                try:
+                    page_index = int(page_value)
+                except (TypeError, ValueError):
+                    continue
+
+                bbox_source = (
+                    item.get("BBox")
+                    or item.get("bbox")
+                    or item.get("rect")
+                    or item.get("Bounds")
+                )
+                bbox = normalize_bbox_input(bbox_source)
+                if not bbox:
+                    continue
+
+                viewer_items_by_value[value].append({
+                    "page": page_index,
+                    "bbox": bbox
+                })
+    else:
+        # Show only selected value (if one is selected)
+        if selected_value is not None:
+            viewer_items_by_value[selected_value] = []
+            for item in items:
+                page_value = item.get("page")
+                if page_value is None:
+                    continue
+
+                try:
+                    page_index = int(page_value)
+                except (TypeError, ValueError):
+                    continue
+
+                bbox_source = (
+                    item.get("BBox")
+                    or item.get("bbox")
+                    or item.get("rect")
+                    or item.get("Bounds")
+                )
+                bbox = normalize_bbox_input(bbox_source)
+                if not bbox:
+                    continue
+
+                viewer_items_by_value[selected_value].append({
+                    "page": page_index,
+                    "bbox": bbox
+                })
+
+    # Get all viewer items for page selection
+    all_viewer_items = []
+    for value_items in viewer_items_by_value.values():
+        all_viewer_items.extend(value_items)
+
+    # If no selection, get pages from PDF document directly
+    if not all_viewer_items:
+        try:
+            import fitz
+            pdf_doc = fitz.open(pdf_obj)
+            num_pages = len(pdf_doc)
+            pdf_doc.close()
+            unique_pages = list(range(num_pages))
+        except Exception:
+            # Default to showing page 1 if we can't get pages from PDF
+            unique_pages = [0]
+    else:
+        unique_pages = sorted({entry["page"] for entry in all_viewer_items})
+
+    # Ensure we always have at least one page to display
+    if not unique_pages:
+        unique_pages = [0]
+
+    display_value = value_label if value_label is not None else selected_value
+    display_value_str = str(display_value) if display_value is not None else "None"
+
+    if selected_value is None:
+        st.caption(f"No selection. Displaying plain document without highlights.")
+    elif display_mode == "Selected value only":
+        st.caption(f"Highlights {property_label} = {display_value_str} items only.")
+    else:
+        st.caption(f"Highlights all {property_label} categories with different colors.")
+
+    page_labels = [f"Page {page + 1}" for page in unique_pages]
+    label_to_page = dict(zip(page_labels, unique_pages))
+
+    controls_col1, controls_col2 = st.columns([3, 1])
+    with controls_col1:
+        selected_page_label = st.selectbox(
+            "Choose a page to view:",
+            options=page_labels,
+            index=0,
+            key=f"{widget_prefix}_page"
+        )
+    with controls_col2:
+        dpi = st.selectbox(
+            "DPI:",
+            options=[100, 150, 200, 300],
+            index=1,
+            key=f"{widget_prefix}_dpi"
+        )
+
+    selected_page = label_to_page[selected_page_label]
+
+    # Create selection highlights with appropriate colors
+    selection_highlights = []
+
+    if display_mode == "All categories" and all_property_data:
+        # Define a color palette for different categories
+        color_palette = [
+            (64, 224, 208, 90),    # Turquoise
+            (255, 165, 0, 90),     # Orange
+            (255, 255, 0, 90),     # Yellow
+            (0, 255, 0, 90),       # Green
+            (0, 255, 255, 90),     # Cyan
+            (0, 0, 255, 90),       # Blue
+            (128, 0, 128, 90),     # Purple
+            (255, 192, 203, 90),   # Pink
+            (255, 140, 0, 90),     # Dark Orange
+            (139, 69, 19, 90),     # Brown
+            (255, 20, 147, 90),    # Deep Pink
+            (30, 144, 255, 90),    # Dodger Blue
+            (138, 43, 226, 90),    # Blue Violet
+            (220, 20, 60, 90),     # Crimson
+            (50, 205, 50, 90),     # Lime Green
+        ]
+
+        # Assign colors to each category value based on ALL available data
+        # This ensures consistent colors across all pages
+        sorted_values = sorted(all_property_data.keys(), key=str)
+        value_to_color = {}
+        for idx, value in enumerate(sorted_values):
+            value_to_color[value] = color_palette[idx % len(color_palette)]
+
+        # Create highlights for all categories
+        for value, value_items in viewer_items_by_value.items():
+            category_color = value_to_color[value]
+            for entry in value_items:
+                selection_highlights.append({
+                    "page": entry["page"],
+                    "bbox": entry["bbox"],
+                    "color": category_color,
+                    "source": source
+                })
+
+        # Create legend showing which color represents which value
+        st.caption("**Color legend:**")
+        legend_cols = st.columns(min(len(sorted_values), 5))
+        for idx, value in enumerate(sorted_values):
+            with legend_cols[idx % len(legend_cols)]:
+                color = value_to_color[value]
+                color_hex = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+                display_val = format_rounding_classification(value) if prop_key in ("text_size", "line_height") and value in globals().get('ROUNDING_CLASSIFICATION_LABELS', {}) else str(value)
+                st.markdown(f'<span style="color:{color_hex}">■</span> {display_val}', unsafe_allow_html=True)
+    else:
+        # Single value mode - use default or provided highlight color
+        highlight_color = highlight_color or (64, 224, 208, 90)
+        for entry in all_viewer_items:
+            selection_highlights.append({
+                "page": entry["page"],
+                "bbox": entry["bbox"],
+                "color": highlight_color,
+                "source": source
+            })
+
+    page_highlights = [item for item in selection_highlights if item["page"] == selected_page]
+
+    with st.spinner(f"Rendering page {selected_page + 1}..."):
+        annotated_img = render_pdf_with_annotations(
+            pdf_path=pdf_obj,
+            page_num=selected_page,
+            hidden_text_items=None,
+            rare_adobe_properties=None,
+            rare_pikepdf_properties=None,
+            docling_table_cells=None,
+            alignment_anomalies=None,
+            alignment_baselines=None,
+            colon_spacing_items=None,
+            text_blocks=None,
+            selection_highlights=page_highlights,
+            dpi=dpi
+        )
+
+    if annotated_img:
+        if selected_value is None:
+            caption_text = f"{property_label} (Page {selected_page + 1}) - No selection"
+        else:
+            caption_text = f"{property_label} = {display_value_str} (Page {selected_page + 1})"
+        st.image(
+            annotated_img,
+            caption=caption_text,
+            width='stretch'
+        )
+    else:
+        st.error("Unable to render the selected page")
 
 
 def main():
@@ -5513,7 +7048,7 @@ def main():
                 st.metric("PDF Version", "Unknown")
 
         # Docling Payload Generation Section (only for OCRed documents)
-        if has_text:
+        if has_text and USE_DOCLING_PAYLOAD:
             st.markdown("---")
             st.subheader("🔧 Docling Payload Generation")
 
@@ -5582,7 +7117,7 @@ def main():
                         button_label = "⚡ Generate Docling Payload"
                         force_regen = False
 
-                    if st.button(button_label, use_container_width=True, key="generate_docling"):
+                    if st.button(button_label, width='stretch', key="generate_docling"):
                         with st.spinner("Generating Docling payload... This may take a minute."):
                             success, message, result_path = generate_docling_payload(
                                 pdf_path,
@@ -5596,7 +7131,7 @@ def main():
                                 st.error(message)
 
                     # Open folder button
-                    if st.button("📁 Open Docling Payloads Folder", use_container_width=True, key="open_docling_folder"):
+                    if st.button("📁 Open Docling Payloads Folder", width='stretch', key="open_docling_folder"):
                         # Create folder if it doesn't exist
                         PAYLOADS_PATH.mkdir(parents=True, exist_ok=True)
                         # Open in file explorer (Windows)
@@ -5604,6 +7139,178 @@ def main():
                             os.startfile(str(PAYLOADS_PATH.absolute()))
                         except:
                             st.info(f"Payloads folder: {PAYLOADS_PATH.absolute()}")
+
+                # PDFPlumber Payload Generation Section (only for OCRed documents)
+                if USE_PDFPLUMBER_PAYLOAD and HAS_PDFPLUMBER:
+                    st.markdown("---")
+                    st.subheader("📊 PDFPlumber Payload Generation")
+
+                    # Character-Level Payload
+                    st.markdown("**Character-Level Payload**")
+                    st.caption("Extracts individual characters with bounding boxes, lines, rectangles, and curves - ideal for glyph analysis")
+
+                    # Check if character-level payload exists
+                    chars_exists, chars_path, chars_info = check_pdfplumber_chars_payload_exists(pdf_path)
+
+                    chars_col1, chars_col2 = st.columns([2, 1])
+
+                    with chars_col1:
+                        if chars_exists:
+                            st.success(f"✅ Character-level payload exists: `{chars_path.name}`")
+
+                            # Load and display metadata
+                            if chars_info:
+                                meta_col1, meta_col2 = st.columns(2)
+                                with meta_col1:
+                                    st.metric("Payload Size", f"{chars_info['file_size_kb']:.1f} KB")
+                                with meta_col2:
+                                    st.metric("Pages", chars_info["num_pages"])
+
+                                st.caption(f"Generated: {chars_info.get('generation_time', 'Unknown')}")
+                        else:
+                            st.warning("⚠️ Character-level payload does not exist yet")
+
+                    with chars_col2:
+                        # Generate button
+                        force_regen_chars = st.checkbox("Force regenerate", key="force_regen_pdfplumber_chars")
+
+                        if st.button("🔄 Generate Chars Payload", key="gen_pdfplumber_chars"):
+                            with st.spinner("Generating character-level payload..."):
+                                success, message, result_path = generate_pdfplumber_chars_payload(
+                                    pdf_path,
+                                    force_regenerate=force_regen_chars
+                                )
+
+                            if success:
+                                st.success(f"✅ {message}")
+                                if result_path:
+                                    st.info(f"Saved to: `{result_path.name}`")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+
+                        # Open folder button
+                        if chars_exists and st.button("📂 Open Chars Folder", key="open_pdfplumber_chars_folder"):
+                            # Create folder if it doesn't exist
+                            PDFPLUMBER_CHARS_PAYLOADS_PATH.mkdir(parents=True, exist_ok=True)
+                            # Open in file explorer (Windows)
+                            try:
+                                os.startfile(str(PDFPLUMBER_CHARS_PAYLOADS_PATH.absolute()))
+                            except:
+                                st.info(f"Character-level folder: {PDFPLUMBER_CHARS_PAYLOADS_PATH.absolute()}")
+
+                    st.markdown("")  # Spacer
+
+                    # Word-Level Payload
+                    st.markdown("**Word-Level Payload**")
+                    st.caption("Extracts words/phrases with bounding boxes - ideal for document analysis")
+
+                    # Check if word-level payload exists
+                    words_exists, words_path, words_info = check_pdfplumber_words_payload_exists(pdf_path)
+
+                    words_col1, words_col2 = st.columns([2, 1])
+
+                    with words_col1:
+                        if words_exists:
+                            st.success(f"✅ Word-level payload exists: `{words_path.name}`")
+
+                            # Load and display metadata
+                            if words_info:
+                                meta_col1, meta_col2 = st.columns(2)
+                                with meta_col1:
+                                    st.metric("Payload Size", f"{words_info['file_size_kb']:.1f} KB")
+                                with meta_col2:
+                                    st.metric("Pages", words_info["num_pages"])
+
+                                st.caption(f"Generated: {words_info.get('generation_time', 'Unknown')}")
+                        else:
+                            st.warning("⚠️ Word-level payload does not exist yet")
+
+                    with words_col2:
+                        # Generate button
+                        force_regen_words = st.checkbox("Force regenerate", key="force_regen_pdfplumber_words")
+
+                        if st.button("🔄 Generate Words Payload", key="gen_pdfplumber_words"):
+                            with st.spinner("Generating word-level payload..."):
+                                success, message, result_path = generate_pdfplumber_words_payload(
+                                    pdf_path,
+                                    force_regenerate=force_regen_words
+                                )
+
+                            if success:
+                                st.success(f"✅ {message}")
+                                if result_path:
+                                    st.info(f"Saved to: `{result_path.name}`")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+
+                        # Open folder button
+                        if words_exists and st.button("📂 Open Words Folder", key="open_pdfplumber_words_folder"):
+                            # Create folder if it doesn't exist
+                            PDFPLUMBER_WORDS_PAYLOADS_PATH.mkdir(parents=True, exist_ok=True)
+                            # Open in file explorer (Windows)
+                            try:
+                                os.startfile(str(PDFPLUMBER_WORDS_PAYLOADS_PATH.absolute()))
+                            except:
+                                st.info(f"Word-level folder: {PDFPLUMBER_WORDS_PAYLOADS_PATH.absolute()}")
+
+                # PyMuPDF Payload Generation Section (only for OCRed documents)
+                if USE_PYMUPDF_PAYLOAD:
+                    st.markdown("---")
+                    st.subheader("📄 PyMuPDF Payload Generation")
+
+                    st.info("ℹ️ PyMuPDF (fitz) extracts text, images, links, drawings, and detailed text structure from PDFs.")
+
+                    # Check if PyMuPDF payload exists
+                    pymupdf_exists, pymupdf_path, pymupdf_info = check_pymupdf_payload_exists(pdf_path)
+
+                    pymupdf_col1, pymupdf_col2 = st.columns([2, 1])
+
+                    with pymupdf_col1:
+                        if pymupdf_exists:
+                            st.success(f"✅ PyMuPDF payload exists: `{pymupdf_path.name}`")
+
+                            # Load and display metadata
+                            if pymupdf_info:
+                                meta_col1, meta_col2 = st.columns(2)
+                                with meta_col1:
+                                    st.metric("Payload Size", f"{pymupdf_info['file_size_kb']:.1f} KB")
+                                with meta_col2:
+                                    st.metric("Pages", pymupdf_info["num_pages"])
+
+                                st.caption(f"Generated: {pymupdf_info.get('generation_time', 'Unknown')}")
+                        else:
+                            st.warning("⚠️ PyMuPDF payload does not exist yet")
+
+                    with pymupdf_col2:
+                        # Generate button
+                        force_regen_pymupdf = st.checkbox("Force regenerate", key="force_regen_pymupdf")
+
+                        if st.button("🔄 Generate PyMuPDF Payload", key="gen_pymupdf"):
+                            with st.spinner("Generating PyMuPDF payload... This may take a minute."):
+                                success, message, result_path = generate_pymupdf_payload(
+                                    pdf_path,
+                                    force_regenerate=force_regen_pymupdf
+                                )
+
+                            if success:
+                                st.success(f"✅ {message}")
+                                if result_path:
+                                    st.info(f"Saved to: `{result_path.name}`")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+
+                        # Open folder button
+                        if pymupdf_exists and st.button("📂 Open PyMuPDF Folder", key="open_pymupdf_folder"):
+                            # Create folder if it doesn't exist
+                            PYMUPDF_PAYLOADS_PATH.mkdir(parents=True, exist_ok=True)
+                            # Open in file explorer (Windows)
+                            try:
+                                os.startfile(str(PYMUPDF_PAYLOADS_PATH.absolute()))
+                            except:
+                                st.info(f"PyMuPDF payloads folder: {PYMUPDF_PAYLOADS_PATH.absolute()}")
 
                 # Adobe/pikepdf Payload Generation Section (only for OCRed documents)
                 st.markdown("---")
@@ -5679,7 +7386,7 @@ def main():
                             adobe_button_label = f"⚡ Generate {payload_type} Payload"
                             adobe_force_regen = False
 
-                        if st.button(adobe_button_label, use_container_width=True, key="generate_adobe"):
+                        if st.button(adobe_button_label, width='stretch', key="generate_adobe"):
                             with st.spinner(f"Generating {payload_type} payload... This may take a minute."):
                                 success, message, result_path = generate_adobe_payload(
                                     pdf_path,
@@ -5696,7 +7403,7 @@ def main():
                         folder_path = PIKEPDF_PAYLOADS_PATH if using_pikepdf else ADOBE_PAYLOADS_PATH
                         folder_name = "pikepdf" if using_pikepdf else "Adobe"
 
-                        if st.button(f"📁 Open {folder_name} Payloads Folder", use_container_width=True, key="open_adobe_folder"):
+                        if st.button(f"📁 Open {folder_name} Payloads Folder", width='stretch', key="open_adobe_folder"):
                             # Create folder if it doesn't exist
                             folder_path.mkdir(parents=True, exist_ok=True)
                             # Open in file explorer (Windows)
@@ -5766,7 +7473,7 @@ def main():
                             enhanced_button_label = "📊 Generate Enhanced Text Info"
                             enhanced_force_regen = False
 
-                        if st.button(enhanced_button_label, use_container_width=True, key="generate_enhanced"):
+                        if st.button(enhanced_button_label, width='stretch', key="generate_enhanced"):
                             with st.spinner("Generating enhanced text info... This may take several minutes (color clustering + edge analysis)."):
                                 success, message, result_path = generate_enhanced_text_info(
                                     pdf_path,
@@ -5780,7 +7487,7 @@ def main():
                                     st.error(message)
 
                         # Open Enhanced Text Info folder button
-                        if st.button("📁 Open Enhanced Text Info Folder", use_container_width=True, key="open_enhanced_folder"):
+                        if st.button("📁 Open Enhanced Text Info Folder", width='stretch', key="open_enhanced_folder"):
                             # Create folder if it doesn't exist
                             ENHANCED_TEXT_INFO_PATH.mkdir(parents=True, exist_ok=True)
                             # Open in file explorer (Windows)
@@ -5806,7 +7513,7 @@ def main():
                             st.caption("- K-means clustering with optimal K selection (Silhouette Score)")
                             st.caption("- DBSCAN with automatic eps determination")
 
-                            if st.button("📈 Perform Cluster Analysis", use_container_width=True, key="cluster_analysis_docling"):
+                            if st.button("📈 Perform Cluster Analysis", width='stretch', key="cluster_analysis_docling"):
                                 with st.spinner("Performing cluster analysis... This may take a minute."):
                                     success, message, result = perform_and_save_cluster_analysis(
                                         enhanced_text_info_path=enhanced_path,
@@ -5852,7 +7559,7 @@ def main():
                                     st.info(f"✓ **Hopkins Statistic: {hopkins_val:.3f}** ({size_context}) - Data shows clustering tendency (>{threshold:.2f}).")
                             else:
                                 st.warning("⚠️ Old cluster result detected. Regenerate to see Hopkins statistic (clustering tendency test).")
-                                if st.button("🔄 Regenerate Now", use_container_width=True, key="regen_cluster_prompt_docling"):
+                                if st.button("🔄 Regenerate Now", width='stretch', key="regen_cluster_prompt_docling"):
                                     with st.spinner("Regenerating cluster analysis..."):
                                         success, message, result = perform_and_save_cluster_analysis(
                                             enhanced_text_info_path=enhanced_path,
@@ -5957,7 +7664,7 @@ def main():
                                     st.success("✓ No significant anomalies detected")
                             elif SHOW_ANOMALY_DETECTION:
                                 st.warning("⚠️ Old cluster result detected. Regenerate to see anomaly detection.")
-                                if st.button("🔄 Regenerate for Anomaly Detection", use_container_width=True, key="regen_anomaly_docling"):
+                                if st.button("🔄 Regenerate for Anomaly Detection", width='stretch', key="regen_anomaly_docling"):
                                     with st.spinner("Regenerating cluster analysis..."):
                                         success, message, result = perform_and_save_cluster_analysis(
                                             enhanced_text_info_path=enhanced_path,
@@ -6036,7 +7743,7 @@ def main():
                                             "Cluster Std": f"{cluster_std[i]:.3f}"
                                         })
 
-                                    st.dataframe(stats_data, use_container_width=True)
+                                    st.dataframe(stats_data, width='stretch')
 
                             # Feature importance for separation
                             if selected_cluster != -1:  # Only for non-noise clusters
@@ -6070,7 +7777,7 @@ def main():
                                         st.caption(f"   Contributes {percentage:.1f}% to cluster separation")
 
                             # Regenerate button
-                            if st.button("🔄 Regenerate Cluster Analysis", use_container_width=True, key="regen_cluster_docling"):
+                            if st.button("🔄 Regenerate Cluster Analysis", width='stretch', key="regen_cluster_docling"):
                                 with st.spinner("Regenerating cluster analysis..."):
                                     success, message, result = perform_and_save_cluster_analysis(
                                         enhanced_text_info_path=enhanced_path,
@@ -6130,7 +7837,7 @@ def main():
                     azure_di_button_label = "☁️ Generate Azure DI Payload"
                     azure_di_force_regen = False
 
-                if st.button(azure_di_button_label, use_container_width=True, key="generate_azure_di"):
+                if st.button(azure_di_button_label, width='stretch', key="generate_azure_di"):
                     with st.spinner("Generating Azure DI payload... This may take a minute."):
                         success, message, result_path = generate_azure_di_payload(
                             pdf_path,
@@ -6144,7 +7851,7 @@ def main():
                             st.error(message)
 
                 # Open Azure DI folder button
-                if st.button("📁 Open Azure DI Payloads Folder", use_container_width=True, key="open_azure_di_folder"):
+                if st.button("📁 Open Azure DI Payloads Folder", width='stretch', key="open_azure_di_folder"):
                     AZURE_DI_PAYLOADS_PATH.mkdir(parents=True, exist_ok=True)
                     try:
                         os.startfile(str(AZURE_DI_PAYLOADS_PATH.absolute()))
@@ -6190,7 +7897,7 @@ def main():
                         enhanced_azure_di_button_label = "📊 Generate Enhanced Text Info"
                         enhanced_azure_di_force_regen = False
 
-                    if st.button(enhanced_azure_di_button_label, use_container_width=True, key="generate_azure_di_enhanced"):
+                    if st.button(enhanced_azure_di_button_label, width='stretch', key="generate_azure_di_enhanced"):
                         with st.spinner("Generating enhanced text info... This may take several minutes."):
                             success, message, result_path = generate_enhanced_text_info_from_azure_di(
                                 pdf_path,
@@ -6220,7 +7927,7 @@ def main():
                         st.caption("- K-means clustering with optimal K selection (Silhouette Score)")
                         st.caption("- DBSCAN with automatic eps determination")
 
-                        if st.button("📈 Perform Cluster Analysis", use_container_width=True, key="cluster_analysis_azure_di"):
+                        if st.button("📈 Perform Cluster Analysis", width='stretch', key="cluster_analysis_azure_di"):
                             with st.spinner("Performing cluster analysis... This may take a minute."):
                                 success, message, result = perform_and_save_cluster_analysis(
                                     enhanced_text_info_path=enhanced_azure_di_path,
@@ -6266,7 +7973,7 @@ def main():
                                 st.info(f"✓ **Hopkins Statistic: {hopkins_val:.3f}** ({size_context}) - Data shows clustering tendency (>{threshold:.2f}).")
                         else:
                             st.warning("⚠️ Old cluster result detected. Regenerate to see Hopkins statistic (clustering tendency test).")
-                            if st.button("🔄 Regenerate Now", use_container_width=True, key="regen_cluster_prompt_azure_di"):
+                            if st.button("🔄 Regenerate Now", width='stretch', key="regen_cluster_prompt_azure_di"):
                                 with st.spinner("Regenerating cluster analysis..."):
                                     success, message, result = perform_and_save_cluster_analysis(
                                         enhanced_text_info_path=enhanced_azure_di_path,
@@ -6381,7 +8088,7 @@ def main():
                                 st.success("✓ No significant anomalies detected")
                         elif SHOW_ANOMALY_DETECTION:
                             st.warning("⚠️ Old cluster result detected. Regenerate to see anomaly detection.")
-                            if st.button("🔄 Regenerate for Anomaly Detection", use_container_width=True, key="regen_anomaly_azure_di"):
+                            if st.button("🔄 Regenerate for Anomaly Detection", width='stretch', key="regen_anomaly_azure_di"):
                                 with st.spinner("Regenerating cluster analysis..."):
                                     success, message, result = perform_and_save_cluster_analysis(
                                         enhanced_text_info_path=enhanced_azure_di_path,
@@ -6460,7 +8167,7 @@ def main():
                                         "Cluster Std": f"{cluster_std[i]:.3f}"
                                     })
 
-                                st.dataframe(stats_data, use_container_width=True)
+                                st.dataframe(stats_data, width='stretch')
 
                         # Feature importance for separation
                         if selected_cluster != -1:  # Only for non-noise clusters
@@ -6494,7 +8201,7 @@ def main():
                                     st.caption(f"   Contributes {percentage:.1f}% to cluster separation")
 
                         # Regenerate button
-                        if st.button("🔄 Regenerate Cluster Analysis", use_container_width=True, key="regen_cluster_azure_di"):
+                        if st.button("🔄 Regenerate Cluster Analysis", width='stretch', key="regen_cluster_azure_di"):
                             with st.spinner("Regenerating cluster analysis..."):
                                 success, message, result = perform_and_save_cluster_analysis(
                                     enhanced_text_info_path=enhanced_azure_di_path,
@@ -6508,12 +8215,14 @@ def main():
                                 else:
                                     st.error(message)
 
-        # Font Analysis Section (only if Docling payload exists and has word-level data, or Adobe payload exists, or pikepdf payload exists)
+        # Font Analysis Section (only if Docling payload exists and has word-level data, or Adobe/pikepdf/PyMuPDF/PDFPlumber payload exists)
         if has_text:
             adobe_exists_for_analysis, adobe_path_for_analysis, _ = check_adobe_payload_exists(pdf_path)
             pikepdf_exists_for_analysis, pikepdf_path_for_analysis, _ = check_pikepdf_payload_exists(pdf_path)
+            pymupdf_exists_for_analysis, pymupdf_path_for_analysis, _ = check_pymupdf_payload_exists(pdf_path)
+            pdfplumber_exists_for_analysis, pdfplumber_path_for_analysis, _ = check_pdfplumber_words_payload_exists(pdf_path)
 
-            if (payload_exists and metadata and metadata.get("has_word_level")) or adobe_exists_for_analysis or pikepdf_exists_for_analysis:
+            if (payload_exists and metadata and metadata.get("has_word_level")) or adobe_exists_for_analysis or pikepdf_exists_for_analysis or pymupdf_exists_for_analysis or pdfplumber_exists_for_analysis:
                 st.markdown("---")
                 st.subheader("🔤 Font Analysis")
 
@@ -6535,165 +8244,183 @@ def main():
                     with st.spinner("Analyzing pikepdf properties..."):
                         pikepdf_analysis = analyze_adobe_payload(pikepdf_path_for_analysis)
 
+                # Analyze PyMuPDF payload if available
+                pymupdf_analysis = None
+                if pymupdf_exists_for_analysis:
+                    with st.spinner("Analyzing PyMuPDF font properties..."):
+                        pymupdf_analysis = analyze_pymupdf_payload(pymupdf_path_for_analysis)
+
+                # Analyze PDFPlumber payload if available
+                pdfplumber_analysis = None
+                if pdfplumber_exists_for_analysis:
+                    with st.spinner("Analyzing PDFPlumber font properties..."):
+                        pdfplumber_analysis = analyze_pdfplumber_payload(pdfplumber_path_for_analysis)
+
                 # Create tabs conditionally based on available analyses
-                tab1 = None
-                tab2 = None
-                tab3 = None
-
-                # Determine which tabs to show
-                tab_names = []
+                # Build list of (tab_name, analysis_data, analysis_type) tuples
+                available_analyses = []
                 if font_analysis:
-                    tab_names.append("Docling Font Analysis")
+                    available_analyses.append(("Docling Font Analysis", font_analysis, "docling"))
                 if adobe_analysis:
-                    tab_names.append("Adobe Property Analysis")
+                    available_analyses.append(("Adobe Property Analysis", adobe_analysis, "adobe"))
                 if pikepdf_analysis:
-                    tab_names.append("pikepdf Property Analysis")
+                    available_analyses.append(("pikepdf Property Analysis", pikepdf_analysis, "pikepdf"))
+                if pymupdf_analysis:
+                    available_analyses.append(("PyMuPDF Property Analysis", pymupdf_analysis, "pymupdf"))
+                if pdfplumber_analysis:
+                    available_analyses.append(("PDFPlumber Property Analysis", pdfplumber_analysis, "pdfplumber"))
 
-                if len(tab_names) == 3:
-                    tab1, tab2, tab3 = st.tabs(tab_names)
-                elif len(tab_names) == 2:
-                    if font_analysis and adobe_analysis:
-                        tab1, tab2 = st.tabs(tab_names)
-                    elif font_analysis and pikepdf_analysis:
-                        tab1, tab3 = st.tabs(tab_names)
-                    else:  # adobe_analysis and pikepdf_analysis
-                        tab2, tab3 = st.tabs(tab_names)
-                elif len(tab_names) == 1:
-                    if font_analysis:
-                        tab1 = st.container()
-                    elif adobe_analysis:
-                        tab2 = st.container()
-                    else:  # pikepdf_analysis
-                        tab3 = st.container()
-                else:
+                if not available_analyses:
                     st.warning("⚠️ No analysis data available")
+                elif len(available_analyses) == 1:
+                    # Single analysis - use container instead of tabs
+                    tab_name, analysis_data, analysis_type = available_analyses[0]
+                    container = st.container()
+                    available_analyses = [(container, analysis_data, analysis_type)]
+                else:
+                    # Multiple analyses - create tabs
+                    tab_names = [name for name, _, _ in available_analyses]
+                    tabs = st.tabs(tab_names)
+                    available_analyses = [(tab, analysis_data, analysis_type) for tab, (_, analysis_data, analysis_type) in zip(tabs, available_analyses)]
 
-                # Docling Font Analysis Tab
-                if tab1 is not None and font_analysis:
-                    with tab1:
-                        # Display overall statistics
-                        stats_col1, stats_col2 = st.columns(2)
-                        with stats_col1:
-                            st.metric("Total Unique Fonts", font_analysis["total_fonts"])
-                        with stats_col2:
-                            st.metric("Total Text Items", font_analysis["total_text_items"])
+                # Render tabs for all available analyses
+                for tab_or_container, analysis_data, analysis_type in available_analyses:
+                    if analysis_type == "docling" and font_analysis:
+                        with tab_or_container:
+                            # Display overall statistics
+                            stats_col1, stats_col2 = st.columns(2)
+                            with stats_col1:
+                                st.metric("Total Unique Fonts", font_analysis["total_fonts"])
+                            with stats_col2:
+                                st.metric("Total Text Items", font_analysis["total_text_items"])
 
-                        # Font statistics table
-                        st.markdown("#### Font Usage Statistics")
+                            # Font statistics table
+                            st.markdown("#### Font Usage Statistics")
 
-                        font_stats = font_analysis["font_stats"]
+                            font_stats = font_analysis["font_stats"]
 
-                        # Create a formatted display of font statistics
-                        if font_stats:
-                            # Display as expandable table
-                            with st.expander(f"📊 View All {len(font_stats)} Fonts", expanded=True):
-                                # Create columns for better layout
-                                for idx, (font_name, count) in enumerate(font_stats.items(), 1):
-                                    percentage = (count / font_analysis["total_text_items"]) * 100
-                                    st.write(f"**{idx}. {font_name}**: {count:,} items ({percentage:.1f}%)")
+                            # Create a formatted display of font statistics
+                            if font_stats:
+                                # Display as expandable table
+                                with st.expander(f"📊 View All {len(font_stats)} Fonts", expanded=True):
+                                    # Create columns for better layout
+                                    for idx, (font_name, count) in enumerate(font_stats.items(), 1):
+                                        percentage = (count / font_analysis["total_text_items"]) * 100
+                                        st.write(f"**{idx}. {font_name}**: {count:,} items ({percentage:.1f}%)")
 
-                        # Font filter selectbox (single selection)
-                        st.markdown("#### Filter Text by Font")
-                        st.write("Select a font to view all text items in that font:")
+                            # Font filter selectbox (single selection)
+                            st.markdown("#### Filter Text by Font")
+                            st.write("Select a font to view all text items in that font:")
 
-                        available_fonts = list(font_stats.keys())
-                        selected_font = st.selectbox(
-                            "Choose a font to display:",
-                            options=["-- Select a font --"] + available_fonts,
-                            index=0,
-                            key="font_filter"
-                        )
-
-                        # Display text items for selected font
-                        if selected_font and selected_font != "-- Select a font --":
-                            st.markdown(f"#### Text Items in: {selected_font}")
-
-                            font_items = font_analysis["font_items"]
-
-                            for font_name in [selected_font]:
-                                items = font_items.get(font_name, [])
-
-                                if items:
-                                    with st.expander(f"**{font_name}** ({len(items)} items)", expanded=True):
-                                        # Group by page for better organization
-                                        items_by_page = {}
-                                        for item in items:
-                                            page = item["page"]
-                                            if page not in items_by_page:
-                                                items_by_page[page] = []
-                                            items_by_page[page].append(item)
-
-                                        # Display items grouped by page
-                                        for page in sorted(items_by_page.keys()):
-                                            st.markdown(f"**Page {page}:**")
-                                            page_items = items_by_page[page]
-
-                                            # Create a scrollable text area with all items
-                                            text_display = []
-                                            for idx, item in enumerate(page_items, 1):
-                                                text = item["text"]
-                                                font_key = item.get("font_key", "N/A")
-                                                confidence = item.get("confidence")
-                                                from_ocr = item.get("from_ocr", False)
-
-                                                # Format with metadata
-                                                meta_info = f"[Font Key: {font_key}"
-                                                if confidence is not None:
-                                                    meta_info += f", Conf: {confidence:.2f}"
-                                                if from_ocr:
-                                                    meta_info += ", OCR"
-                                                meta_info += "]"
-
-                                                text_display.append(f"{idx}. {text} {meta_info}")
-
-                                            # Display in text area
-                                            st.text_area(
-                                                f"Items on page {page}",
-                                                value="\n".join(text_display),
-                                                height=min(300, max(100, len(page_items) * 20)),
-                                                key=f"docling_font_{font_name}_page_{page}"
-                                            )
-                                            st.caption(f"{len(page_items)} items on this page")
-                        else:
-                            st.info("👆 Select a font from the dropdown above to view its text items")
-
-                # Adobe Property Analysis Tab
-                if tab2 is not None and adobe_analysis:
-                    with tab2:
-                        # Create property selectbox
-                        st.markdown("#### Select Property to Analyze")
-
-                        available_properties = []
-                        if adobe_analysis["embedded"]["total"] > 0:
-                            available_properties.append("Embedded")
-                        if adobe_analysis["encoding"]["total"] > 0:
-                            available_properties.append("Encoding")
-                        if adobe_analysis["family_name"]["total"] > 0:
-                            available_properties.append("Family Name")
-                        if adobe_analysis["name"]["total"] > 0:
-                            available_properties.append("Name")
-                        if adobe_analysis["monospaced"]["total"] > 0:
-                            available_properties.append("Monospaced")
-                        if adobe_analysis["subset"]["total"] > 0:
-                            available_properties.append("Subset")
-                        if adobe_analysis["has_clip"]["total"] > 0:
-                            available_properties.append("HasClip")
-                        if adobe_analysis["text_size"]["total"] > 0:
-                            available_properties.append("TextSize")
-                        if adobe_analysis["line_height"]["total"] > 0:
-                            available_properties.append("LineHeight")
-
-                        if not available_properties:
-                            st.warning("No properties found in Adobe payload")
-                        else:
-                            selected_property = st.selectbox(
-                                "Choose a property to analyze:",
-                                options=["-- Select a property --"] + available_properties,
+                            available_fonts = list(font_stats.keys())
+                            selected_font = st.selectbox(
+                                "Choose a font to display:",
+                                options=["-- Select a font --"] + available_fonts,
                                 index=0,
-                                key="adobe_property_filter"
+                                key="font_filter"
                             )
 
-                            if selected_property and selected_property != "-- Select a property --":
+                            # Display text items for selected font
+                            font_items = font_analysis["font_items"]
+
+                            if selected_font and selected_font != "-- Select a font --":
+                                st.markdown(f"#### Text Items in: {selected_font}")
+
+                                for font_name in [selected_font]:
+                                    items = font_items.get(font_name, [])
+
+                                    if items:
+                                        with st.expander(f"**{font_name}** ({len(items)} items)", expanded=True):
+                                            # Group by page for better organization
+                                            items_by_page = {}
+                                            for item in items:
+                                                page = item["page"]
+                                                if page not in items_by_page:
+                                                    items_by_page[page] = []
+                                                items_by_page[page].append(item)
+
+                                            # Display items grouped by page
+                                            for page in sorted(items_by_page.keys()):
+                                                st.markdown(f"**Page {page}:**")
+                                                page_items = items_by_page[page]
+
+                                                # Create a scrollable text area with all items
+                                                text_display = []
+                                                for idx, item in enumerate(page_items, 1):
+                                                    text = item["text"]
+                                                    font_key = item.get("font_key", "N/A")
+                                                    confidence = item.get("confidence")
+                                                    from_ocr = item.get("from_ocr", False)
+
+                                                    # Format with metadata
+                                                    meta_info = f"[Font Key: {font_key}"
+                                                    if confidence is not None:
+                                                        meta_info += f", Conf: {confidence:.2f}"
+                                                    if from_ocr:
+                                                        meta_info += ", OCR"
+                                                    meta_info += "]"
+
+                                                    text_display.append(f"{idx}. {text} {meta_info}")
+
+                                                # Display in text area
+                                                st.text_area(
+                                                    f"Items on page {page}",
+                                                    value="\n".join(text_display),
+                                                    height=min(300, max(100, len(page_items) * 20)),
+                                                    key=f"docling_font_{font_name}_page_{page}"
+                                                )
+                                                st.caption(f"{len(page_items)} items on this page")
+                            else:
+                                st.info("👆 Select a font from the dropdown above to view its text items")
+
+                            # Always show document viewer (with or without selection)
+                            render_font_property_selection_viewer(
+                                pdf_path=pdf_path,
+                                prop_key="docling_font",
+                                property_label="Font",
+                                selected_value=selected_font if (selected_font and selected_font != "-- Select a font --") else None,
+                                value_label=selected_font if (selected_font and selected_font != "-- Select a font --") else None,
+                                items=font_items.get(selected_font, []) if (selected_font and selected_font != "-- Select a font --") else [],
+                                source="docling",
+                                highlight_color=(64, 224, 208, 90),
+                                all_property_data=font_items
+                            )
+
+                    elif analysis_type == "adobe" and adobe_analysis:
+                        with tab_or_container:
+                            # Create property selectbox
+                            st.markdown("#### Select Property to Analyze")
+
+                            available_properties = []
+                            if adobe_analysis["embedded"]["total"] > 0:
+                                available_properties.append("Embedded")
+                            if adobe_analysis["encoding"]["total"] > 0:
+                                available_properties.append("Encoding")
+                            if adobe_analysis["family_name"]["total"] > 0:
+                                available_properties.append("Family Name")
+                            if adobe_analysis["name"]["total"] > 0:
+                                available_properties.append("Name")
+                            if adobe_analysis["monospaced"]["total"] > 0:
+                                available_properties.append("Monospaced")
+                            if adobe_analysis["subset"]["total"] > 0:
+                                available_properties.append("Subset")
+                            if adobe_analysis["has_clip"]["total"] > 0:
+                                available_properties.append("HasClip")
+                            if adobe_analysis["text_size"]["total"] > 0:
+                                available_properties.append("TextSize")
+                            if adobe_analysis["line_height"]["total"] > 0:
+                                available_properties.append("LineHeight")
+
+                            if not available_properties:
+                                st.warning("No properties found in Adobe payload")
+                            else:
+                                selected_property = st.selectbox(
+                                    "Choose a property to analyze:",
+                                    options=["-- Select a property --"] + available_properties,
+                                    index=0,
+                                    key="adobe_property_filter"
+                                )
+
                                 # Map display name to internal key
                                 property_map = {
                                     "Embedded": "embedded",
@@ -6707,41 +8434,279 @@ def main():
                                     "LineHeight": "line_height"
                                 }
 
-                                prop_key = property_map[selected_property]
-                                prop_data = adobe_analysis[prop_key]
+                                if selected_property and selected_property != "-- Select a property --":
+                                    prop_key = property_map[selected_property]
+                                    prop_data = adobe_analysis[prop_key]
 
-                                # Display statistics
+                                    # Display statistics
+                                    st.markdown(f"#### {selected_property} Statistics")
+                                    st.metric("Total Items", prop_data["total"])
+
+                                    # Show value distribution
+                                    with st.expander(f"📊 {selected_property} Values", expanded=True):
+                                        for value, count in prop_data["stats"].items():
+                                            percentage = (count / prop_data["total"]) * 100
+                                            display_value = format_rounding_classification(value) if prop_key in ("text_size", "line_height") else value
+                                            st.write(f"**{display_value}**: {count:,} items ({percentage:.1f}%)")
+
+                                    # Value selectbox
+                                    st.markdown(f"#### Filter by {selected_property} Value")
+                                    available_values = list(prop_data["stats"].keys())
+                                    selected_value = st.selectbox(
+                                        f"Choose a {selected_property.lower()} value:",
+                                        options=["-- Select a value --"] + available_values,
+                                        index=0,
+                                        key=f"adobe_{prop_key}_value",
+                                        format_func=lambda v: format_rounding_classification(v) if v in ROUNDING_CLASSIFICATION_LABELS else v
+                                    )
+
+                                    # Display text items for selected value
+                                    if selected_value and selected_value != "-- Select a value --":
+                                        items = prop_data["items"].get(selected_value, [])
+
+                                        if items:
+                                            display_selected_label = format_rounding_classification(selected_value) if selected_value in ROUNDING_CLASSIFICATION_LABELS else selected_value
+                                            st.markdown(f"#### Text Items with {selected_property} = {display_selected_label}")
+
+                                            with st.expander(f"{len(items)} items", expanded=True):
+                                                # Group by page
+                                                items_by_page = {}
+                                                for item in items:
+                                                    page = item["page"]
+                                                    if page not in items_by_page:
+                                                        items_by_page[page] = []
+                                                    items_by_page[page].append(item)
+
+                                                # Display by page
+                                                for page in sorted(items_by_page.keys()):
+                                                    st.markdown(f"**Page {page}:**")
+                                                    page_items = items_by_page[page]
+
+                                                    text_display = []
+                                                    for idx, item in enumerate(page_items, 1):
+                                                        text = item["text"]
+                                                        if prop_key == "text_size" and "exact_size" in item:
+                                                            classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
+                                                            text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_size']}]")
+                                                        elif prop_key == "line_height" and "exact_height" in item:
+                                                            classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
+                                                            text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_height']}]")
+                                                        else:
+                                                            text_display.append(f"{idx}. {text}")
+
+                                                    st.text_area(
+                                                        f"Items on page {page}",
+                                                        value="\n".join(text_display),
+                                                        height=min(300, max(100, len(page_items) * 20)),
+                                                        key=f"adobe_{prop_key}_{selected_value}_page_{page}"
+                                                    )
+                                                    st.caption(f"{len(page_items)} items on this page")
+                                        else:
+                                            st.info("No items found for this value")
+                                    else:
+                                        st.info("👆 Select a value from the dropdown above to view text items")
+
+                                    # Always show document viewer (with or without value selection)
+                                    render_font_property_selection_viewer(
+                                        pdf_path=pdf_path,
+                                        prop_key=prop_key,
+                                        property_label=selected_property,
+                                        selected_value=selected_value if (selected_value and selected_value != "-- Select a value --") else None,
+                                        value_label=format_rounding_classification(selected_value) if (selected_value and selected_value != "-- Select a value --" and selected_value in ROUNDING_CLASSIFICATION_LABELS) else (selected_value if (selected_value and selected_value != "-- Select a value --") else None),
+                                        items=prop_data["items"].get(selected_value, []) if (selected_value and selected_value != "-- Select a value --") else [],
+                                        source="adobe",
+                                        all_property_data=prop_data["items"]
+                                    )
+                                else:
+                                    st.info("👆 Select a property from the dropdown above to begin analysis")
+
+                    elif analysis_type == "pikepdf" and pikepdf_analysis:
+                        with tab_or_container:
+                            # Create property selectbox
+                            st.markdown("#### Select Property to Analyze")
+
+                            available_properties = []
+                            if pikepdf_analysis["embedded"]["total"] > 0:
+                                available_properties.append("Embedded")
+                            if pikepdf_analysis["encoding"]["total"] > 0:
+                                available_properties.append("Encoding")
+                            if pikepdf_analysis["family_name"]["total"] > 0:
+                                available_properties.append("Family Name")
+                            if pikepdf_analysis["name"]["total"] > 0:
+                                available_properties.append("Name")
+                            if pikepdf_analysis["monospaced"]["total"] > 0:
+                                available_properties.append("Monospaced")
+                            if pikepdf_analysis["subset"]["total"] > 0:
+                                available_properties.append("Subset")
+                            if pikepdf_analysis["has_clip"]["total"] > 0:
+                                available_properties.append("HasClip")
+                            if pikepdf_analysis["text_size"]["total"] > 0:
+                                available_properties.append("TextSize")
+                            if pikepdf_analysis["line_height"]["total"] > 0:
+                                available_properties.append("LineHeight")
+
+                            if not available_properties:
+                                st.warning("No properties found in pikepdf payload")
+                            else:
+                                selected_property = st.selectbox(
+                                    "Choose a property to analyze:",
+                                    options=["-- Select a property --"] + available_properties,
+                                    index=0,
+                                    key="pikepdf_property_filter"
+                                )
+
+                                # Map display name to internal key
+                                property_map = {
+                                    "Embedded": "embedded",
+                                    "Encoding": "encoding",
+                                    "Family Name": "family_name",
+                                    "Name": "name",
+                                    "Monospaced": "monospaced",
+                                    "Subset": "subset",
+                                    "HasClip": "has_clip",
+                                    "TextSize": "text_size",
+                                    "LineHeight": "line_height"
+                                }
+
+                                if selected_property and selected_property != "-- Select a property --":
+                                    prop_key = property_map[selected_property]
+                                    prop_data = pikepdf_analysis[prop_key]
+
+                                    # Display statistics
+                                    st.markdown(f"#### {selected_property} Statistics")
+                                    st.metric("Total Items", prop_data["total"])
+
+                                    # Show value distribution
+                                    with st.expander(f"📊 {selected_property} Values", expanded=True):
+                                        for value, count in prop_data["stats"].items():
+                                            percentage = (count / prop_data["total"]) * 100
+                                            display_value = format_rounding_classification(value) if prop_key in ("text_size", "line_height") else value
+                                            st.write(f"**{display_value}**: {count:,} items ({percentage:.1f}%)")
+
+                                    # Value selectbox
+                                    st.markdown(f"#### Filter by {selected_property} Value")
+                                    available_values = list(prop_data["stats"].keys())
+                                    selected_value = st.selectbox(
+                                        f"Choose a {selected_property.lower()} value:",
+                                        options=["-- Select a value --"] + available_values,
+                                        index=0,
+                                        key=f"pikepdf_{prop_key}_value",
+                                        format_func=lambda v: format_rounding_classification(v) if v in ROUNDING_CLASSIFICATION_LABELS else v
+                                    )
+
+                                    # Display text items for selected value
+                                    if selected_value and selected_value != "-- Select a value --":
+                                        items = prop_data["items"].get(selected_value, [])
+
+                                        if items:
+                                            display_selected_label = format_rounding_classification(selected_value) if selected_value in ROUNDING_CLASSIFICATION_LABELS else selected_value
+                                            st.markdown(f"#### Text Items with {selected_property} = {display_selected_label}")
+
+                                            with st.expander(f"{len(items)} items", expanded=True):
+                                                # Group by page
+                                                items_by_page = {}
+                                                for item in items:
+                                                    page = item["page"]
+                                                    if page not in items_by_page:
+                                                        items_by_page[page] = []
+                                                    items_by_page[page].append(item)
+
+                                                # Display by page
+                                                for page in sorted(items_by_page.keys()):
+                                                    st.markdown(f"**Page {page}:**")
+                                                    page_items = items_by_page[page]
+
+                                                    text_display = []
+                                                    for idx, item in enumerate(page_items, 1):
+                                                        text = item["text"]
+                                                        if prop_key == "text_size" and "exact_size" in item:
+                                                            classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
+                                                            text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_size']}]")
+                                                        elif prop_key == "line_height" and "exact_height" in item:
+                                                            classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
+                                                            text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_height']}]")
+                                                        else:
+                                                            text_display.append(f"{idx}. {text}")
+
+                                                    st.text_area(
+                                                        f"Items on page {page}",
+                                                        value="\n".join(text_display),
+                                                        height=min(300, max(100, len(page_items) * 20)),
+                                                        key=f"pikepdf_{prop_key}_{selected_value}_page_{page}"
+                                                    )
+                                                    st.caption(f"{len(page_items)} items on this page")
+                                        else:
+                                            st.info("No items found for this value")
+                                    else:
+                                        st.info("👆 Select a value from the dropdown above to view text items")
+
+                                    # Always show document viewer (with or without value selection)
+                                    render_font_property_selection_viewer(
+                                        pdf_path=pdf_path,
+                                        prop_key=prop_key,
+                                        property_label=selected_property,
+                                        selected_value=selected_value if (selected_value and selected_value != "-- Select a value --") else None,
+                                        value_label=format_rounding_classification(selected_value) if (selected_value and selected_value != "-- Select a value --" and selected_value in ROUNDING_CLASSIFICATION_LABELS) else (selected_value if (selected_value and selected_value != "-- Select a value --") else None),
+                                        items=prop_data["items"].get(selected_value, []) if (selected_value and selected_value != "-- Select a value --") else [],
+                                        source="pikepdf",
+                                        all_property_data=prop_data["items"]
+                                    )
+                                else:
+                                    st.info("👆 Select a property from the dropdown above to begin analysis")
+
+                    elif analysis_type == "pymupdf" and pymupdf_analysis:
+                        with tab_or_container:
+                            st.markdown("### PyMuPDF Font Properties")
+                            st.caption("Analysis of font properties extracted using PyMuPDF (font, size, color)")
+
+                            # Property selector
+                            property_options = ["-- Select a property --"]
+                            if "font" in pymupdf_analysis and pymupdf_analysis["font"]["total"] > 0:
+                                property_options.append("Font")
+                            if "size" in pymupdf_analysis and pymupdf_analysis["size"]["total"] > 0:
+                                property_options.append("Size")
+                            if "color" in pymupdf_analysis and pymupdf_analysis["color"]["total"] > 0:
+                                property_options.append("Color")
+
+                            selected_property = st.selectbox(
+                                "Choose a property to analyze:",
+                                options=property_options,
+                                index=0,
+                                key="pymupdf_property_select"
+                            )
+
+                            property_map = {"Font": "font", "Size": "size", "Color": "color"}
+
+                            if selected_property != "-- Select a property --":
+                                prop_key = property_map[selected_property]
+                                prop_data = pymupdf_analysis[prop_key]
+
                                 st.markdown(f"#### {selected_property} Statistics")
                                 st.metric("Total Items", prop_data["total"])
 
-                                # Show value distribution
                                 with st.expander(f"📊 {selected_property} Values", expanded=True):
                                     for value, count in prop_data["stats"].items():
                                         percentage = (count / prop_data["total"]) * 100
-                                        display_value = format_rounding_classification(value) if prop_key in ("text_size", "line_height") else value
+                                        display_value = format_rounding_classification(value) if prop_key == "size" and value in globals().get('ROUNDING_CLASSIFICATION_LABELS', {}) else value
                                         st.write(f"**{display_value}**: {count:,} items ({percentage:.1f}%)")
 
-                                # Value selectbox
                                 st.markdown(f"#### Filter by {selected_property} Value")
                                 available_values = list(prop_data["stats"].keys())
                                 selected_value = st.selectbox(
                                     f"Choose a {selected_property.lower()} value:",
                                     options=["-- Select a value --"] + available_values,
                                     index=0,
-                                    key=f"adobe_{prop_key}_value",
+                                    key=f"pymupdf_{prop_key}_value",
                                     format_func=lambda v: format_rounding_classification(v) if v in ROUNDING_CLASSIFICATION_LABELS else v
                                 )
 
-                                # Display text items for selected value
-                                if selected_value and selected_value != "-- Select a value --":
+                                if selected_value != "-- Select a value --":
                                     items = prop_data["items"].get(selected_value, [])
-
                                     if items:
                                         display_selected_label = format_rounding_classification(selected_value) if selected_value in ROUNDING_CLASSIFICATION_LABELS else selected_value
                                         st.markdown(f"#### Text Items with {selected_property} = {display_selected_label}")
 
                                         with st.expander(f"{len(items)} items", expanded=True):
-                                            # Group by page
                                             items_by_page = {}
                                             for item in items:
                                                 page = item["page"]
@@ -6749,122 +8714,78 @@ def main():
                                                     items_by_page[page] = []
                                                 items_by_page[page].append(item)
 
-                                            # Display by page
                                             for page in sorted(items_by_page.keys()):
                                                 st.markdown(f"**Page {page}:**")
                                                 page_items = items_by_page[page]
-
-                                                text_display = []
-                                                for idx, item in enumerate(page_items, 1):
-                                                    text = item["text"]
-                                                    if prop_key == "text_size" and "exact_size" in item:
-                                                        classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
-                                                        text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_size']}]")
-                                                    elif prop_key == "line_height" and "exact_height" in item:
-                                                        classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
-                                                        text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_height']}]")
-                                                    else:
-                                                        text_display.append(f"{idx}. {text}")
-
-                                                st.text_area(
-                                                    f"Items on page {page}",
-                                                    value="\n".join(text_display),
-                                                    height=min(300, max(100, len(page_items) * 20)),
-                                                    key=f"adobe_{prop_key}_{selected_value}_page_{page}"
-                                                )
+                                                text_display = [f"{idx}. {item['text']}" for idx, item in enumerate(page_items, 1)]
+                                                st.text_area(f"Items on page {page}", value="\n".join(text_display), height=min(300, max(100, len(page_items) * 20)), key=f"pymupdf_{prop_key}_{selected_value}_page_{page}")
                                                 st.caption(f"{len(page_items)} items on this page")
-                                    else:
-                                        st.info("No items found for this value")
+
+                                        render_font_property_selection_viewer(
+                                            pdf_path=pdf_path,
+                                            prop_key=prop_key,
+                                            property_label=selected_property,
+                                            selected_value=selected_value,
+                                            value_label=display_selected_label,
+                                            items=items,
+                                            source="pymupdf",
+                                            all_property_data=prop_data["items"]
+                                        )
                                 else:
                                     st.info("👆 Select a value from the dropdown above to view text items")
                             else:
                                 st.info("👆 Select a property from the dropdown above to begin analysis")
 
-                # pikepdf Property Analysis Tab
-                if tab3 is not None and pikepdf_analysis:
-                    with tab3:
-                        # Create property selectbox
-                        st.markdown("#### Select Property to Analyze")
+                    elif analysis_type == "pdfplumber" and pdfplumber_analysis:
+                        with tab_or_container:
+                            st.markdown("### PDFPlumber Font Properties")
+                            st.caption("Analysis of font properties extracted using PDFPlumber (fontname, size)")
 
-                        available_properties = []
-                        if pikepdf_analysis["embedded"]["total"] > 0:
-                            available_properties.append("Embedded")
-                        if pikepdf_analysis["encoding"]["total"] > 0:
-                            available_properties.append("Encoding")
-                        if pikepdf_analysis["family_name"]["total"] > 0:
-                            available_properties.append("Family Name")
-                        if pikepdf_analysis["name"]["total"] > 0:
-                            available_properties.append("Name")
-                        if pikepdf_analysis["monospaced"]["total"] > 0:
-                            available_properties.append("Monospaced")
-                        if pikepdf_analysis["subset"]["total"] > 0:
-                            available_properties.append("Subset")
-                        if pikepdf_analysis["has_clip"]["total"] > 0:
-                            available_properties.append("HasClip")
-                        if pikepdf_analysis["text_size"]["total"] > 0:
-                            available_properties.append("TextSize")
-                        if pikepdf_analysis["line_height"]["total"] > 0:
-                            available_properties.append("LineHeight")
+                            property_options = ["-- Select a property --"]
+                            if "fontname" in pdfplumber_analysis and pdfplumber_analysis["fontname"]["total"] > 0:
+                                property_options.append("Fontname")
+                            if "size" in pdfplumber_analysis and pdfplumber_analysis["size"]["total"] > 0:
+                                property_options.append("Size")
 
-                        if not available_properties:
-                            st.warning("No properties found in pikepdf payload")
-                        else:
                             selected_property = st.selectbox(
                                 "Choose a property to analyze:",
-                                options=["-- Select a property --"] + available_properties,
+                                options=property_options,
                                 index=0,
-                                key="pikepdf_property_filter"
+                                key="pdfplumber_property_select"
                             )
 
-                            if selected_property and selected_property != "-- Select a property --":
-                                # Map display name to internal key
-                                property_map = {
-                                    "Embedded": "embedded",
-                                    "Encoding": "encoding",
-                                    "Family Name": "family_name",
-                                    "Name": "name",
-                                    "Monospaced": "monospaced",
-                                    "Subset": "subset",
-                                    "HasClip": "has_clip",
-                                    "TextSize": "text_size",
-                                    "LineHeight": "line_height"
-                                }
+                            property_map = {"Fontname": "fontname", "Size": "size"}
 
+                            if selected_property != "-- Select a property --":
                                 prop_key = property_map[selected_property]
-                                prop_data = pikepdf_analysis[prop_key]
+                                prop_data = pdfplumber_analysis[prop_key]
 
-                                # Display statistics
                                 st.markdown(f"#### {selected_property} Statistics")
                                 st.metric("Total Items", prop_data["total"])
 
-                                # Show value distribution
                                 with st.expander(f"📊 {selected_property} Values", expanded=True):
                                     for value, count in prop_data["stats"].items():
                                         percentage = (count / prop_data["total"]) * 100
-                                        display_value = format_rounding_classification(value) if prop_key in ("text_size", "line_height") else value
+                                        display_value = format_rounding_classification(value) if prop_key == "size" and value in globals().get('ROUNDING_CLASSIFICATION_LABELS', {}) else value
                                         st.write(f"**{display_value}**: {count:,} items ({percentage:.1f}%)")
 
-                                # Value selectbox
                                 st.markdown(f"#### Filter by {selected_property} Value")
                                 available_values = list(prop_data["stats"].keys())
                                 selected_value = st.selectbox(
                                     f"Choose a {selected_property.lower()} value:",
                                     options=["-- Select a value --"] + available_values,
                                     index=0,
-                                    key=f"pikepdf_{prop_key}_value",
+                                    key=f"pdfplumber_{prop_key}_value",
                                     format_func=lambda v: format_rounding_classification(v) if v in ROUNDING_CLASSIFICATION_LABELS else v
                                 )
 
-                                # Display text items for selected value
-                                if selected_value and selected_value != "-- Select a value --":
+                                if selected_value != "-- Select a value --":
                                     items = prop_data["items"].get(selected_value, [])
-
                                     if items:
                                         display_selected_label = format_rounding_classification(selected_value) if selected_value in ROUNDING_CLASSIFICATION_LABELS else selected_value
                                         st.markdown(f"#### Text Items with {selected_property} = {display_selected_label}")
 
                                         with st.expander(f"{len(items)} items", expanded=True):
-                                            # Group by page
                                             items_by_page = {}
                                             for item in items:
                                                 page = item["page"]
@@ -6872,32 +8793,23 @@ def main():
                                                     items_by_page[page] = []
                                                 items_by_page[page].append(item)
 
-                                            # Display by page
                                             for page in sorted(items_by_page.keys()):
                                                 st.markdown(f"**Page {page}:**")
                                                 page_items = items_by_page[page]
-
-                                                text_display = []
-                                                for idx, item in enumerate(page_items, 1):
-                                                    text = item["text"]
-                                                    if prop_key == "text_size" and "exact_size" in item:
-                                                        classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
-                                                        text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_size']}]")
-                                                    elif prop_key == "line_height" and "exact_height" in item:
-                                                        classification_label = item.get("classification_label") or format_rounding_classification(item.get("classification", ""))
-                                                        text_display.append(f"{idx}. {text} [{classification_label}; Exact: {item['exact_height']}]")
-                                                    else:
-                                                        text_display.append(f"{idx}. {text}")
-
-                                                st.text_area(
-                                                    f"Items on page {page}",
-                                                    value="\n".join(text_display),
-                                                    height=min(300, max(100, len(page_items) * 20)),
-                                                    key=f"pikepdf_{prop_key}_{selected_value}_page_{page}"
-                                                )
+                                                text_display = [f"{idx}. {item['text']}" for idx, item in enumerate(page_items, 1)]
+                                                st.text_area(f"Items on page {page}", value="\n".join(text_display), height=min(300, max(100, len(page_items) * 20)), key=f"pdfplumber_{prop_key}_{selected_value}_page_{page}")
                                                 st.caption(f"{len(page_items)} items on this page")
-                                    else:
-                                        st.info("No items found for this value")
+
+                                        render_font_property_selection_viewer(
+                                            pdf_path=pdf_path,
+                                            prop_key=prop_key,
+                                            property_label=selected_property,
+                                            selected_value=selected_value,
+                                            value_label=display_selected_label,
+                                            items=items,
+                                            source="pdfplumber",
+                                            all_property_data=prop_data["items"]
+                                        )
                                 else:
                                     st.info("👆 Select a value from the dropdown above to view text items")
                             else:
@@ -6941,7 +8853,7 @@ def main():
 
                         with detect_col2:
                             if detection_exists:
-                                if st.button("🔄 Regenerate", use_container_width=True, key="regen_detection"):
+                                if st.button("🔄 Regenerate", width='stretch', key="regen_detection"):
                                     with st.spinner("Detecting hidden text... This may take a minute."):
                                         detection_result = detect_hidden_text(pdf_path, payload_path)
 
@@ -6957,7 +8869,7 @@ def main():
 
                                 latest_visible_payload = get_latest_visible_payload_path(pdf_path)
                                 if latest_visible_payload and latest_visible_payload.exists():
-                                    if st.button("↻ Reprocess", use_container_width=True, key="reprocess_detection"):
+                                    if st.button("↻ Reprocess", width='stretch', key="reprocess_detection"):
                                         with st.spinner("Reprocessing hidden text comparison..."):
                                             detection_result = detect_hidden_text(
                                                 pdf_path,
@@ -6974,7 +8886,7 @@ def main():
                                                     st.success("Hidden text comparison reprocessed using existing flattened payload.")
                                                     st.rerun()
                             else:
-                                if st.button("🔎 Detect Hidden Text", use_container_width=True):
+                                if st.button("🔎 Detect Hidden Text", width='stretch'):
                                     with st.spinner("Detecting hidden text... This may take a minute."):
                                         detection_result = detect_hidden_text(pdf_path, payload_path)
 
@@ -6992,6 +8904,45 @@ def main():
                             try:
                                 with open(detection_path, 'r', encoding='utf-8') as f:
                                     detection_result = json.load(f)
+
+                                    # Filter out items with unknown/invalid text from loaded results
+                                    def is_valid_text_filter(text: str) -> bool:
+                                        if not text:
+                                            return False
+                                        text_stripped = text.strip()
+                                        if not text_stripped:
+                                            return False
+                                        if text_stripped in ("<unknown>", "unknown", "<none>", "None"):
+                                            return False
+                                        return True
+
+                                    # Filter all hidden items arrays
+                                    if "hidden_items_with_overlap" in detection_result:
+                                        detection_result["hidden_items_with_overlap"] = [
+                                            item for item in detection_result["hidden_items_with_overlap"]
+                                            if is_valid_text_filter(item.get('text', '') or item.get('hidden_text', ''))
+                                        ]
+                                    if "hidden_items_no_overlap" in detection_result:
+                                        detection_result["hidden_items_no_overlap"] = [
+                                            item for item in detection_result["hidden_items_no_overlap"]
+                                            if is_valid_text_filter(item.get('text', ''))
+                                        ]
+                                    if "hidden_items" in detection_result:
+                                        detection_result["hidden_items"] = [
+                                            item for item in detection_result["hidden_items"]
+                                            if is_valid_text_filter(item.get('text', '') or item.get('hidden_text', ''))
+                                        ]
+                                    if "all_hidden_items" in detection_result:
+                                        detection_result["all_hidden_items"] = [
+                                            item for item in detection_result["all_hidden_items"]
+                                            if is_valid_text_filter(item.get('text', '') or item.get('hidden_text', ''))
+                                        ]
+
+                                    # Update counts
+                                    detection_result["total_hidden"] = len(detection_result.get("all_hidden_items", []))
+                                    detection_result["total_hidden_with_overlap"] = len(detection_result.get("hidden_items_with_overlap", []))
+                                    detection_result["total_hidden_no_overlap"] = len(detection_result.get("hidden_items_no_overlap", []))
+
                                     st.session_state['hidden_text_result'] = detection_result
                                     st.session_state['last_pdf_path'] = str(pdf_path)
                             except Exception as e:
@@ -7222,6 +9173,56 @@ def main():
 
                         # Check for hidden text detection results
                         if payload_exists and metadata and metadata.get("has_word_level"):
+                            # First, check if detection JSON exists and load it if not in session state
+                            detection_exists, detection_path, _ = check_overlapping_bboxes_exists(pdf_path)
+                            if detection_exists and ('hidden_text_result' not in st.session_state or st.session_state.get('last_pdf_path') != str(pdf_path)):
+                                try:
+                                    with open(detection_path, 'r', encoding='utf-8') as f:
+                                        detection_result = json.load(f)
+
+                                        # Filter out items with unknown/invalid text from loaded results
+                                        def is_valid_text_filter(text: str) -> bool:
+                                            if not text:
+                                                return False
+                                            text_stripped = text.strip()
+                                            if not text_stripped:
+                                                return False
+                                            if text_stripped in ("<unknown>", "unknown", "<none>", "None"):
+                                                return False
+                                            return True
+
+                                        # Filter all hidden items arrays
+                                        if "hidden_items_with_overlap" in detection_result:
+                                            detection_result["hidden_items_with_overlap"] = [
+                                                item for item in detection_result["hidden_items_with_overlap"]
+                                                if is_valid_text_filter(item.get('text', '') or item.get('hidden_text', ''))
+                                            ]
+                                        if "hidden_items_no_overlap" in detection_result:
+                                            detection_result["hidden_items_no_overlap"] = [
+                                                item for item in detection_result["hidden_items_no_overlap"]
+                                                if is_valid_text_filter(item.get('text', ''))
+                                            ]
+                                        if "hidden_items" in detection_result:
+                                            detection_result["hidden_items"] = [
+                                                item for item in detection_result["hidden_items"]
+                                                if is_valid_text_filter(item.get('text', '') or item.get('hidden_text', ''))
+                                            ]
+                                        if "all_hidden_items" in detection_result:
+                                            detection_result["all_hidden_items"] = [
+                                                item for item in detection_result["all_hidden_items"]
+                                                if is_valid_text_filter(item.get('text', '') or item.get('hidden_text', ''))
+                                            ]
+
+                                        # Update counts
+                                        detection_result["total_hidden"] = len(detection_result.get("all_hidden_items", []))
+                                        detection_result["total_hidden_with_overlap"] = len(detection_result.get("hidden_items_with_overlap", []))
+                                        detection_result["total_hidden_no_overlap"] = len(detection_result.get("hidden_items_no_overlap", []))
+
+                                        st.session_state['hidden_text_result'] = detection_result
+                                        st.session_state['last_pdf_path'] = str(pdf_path)
+                                except Exception:
+                                    pass  # If loading fails, continue without hidden text results
+
                             # Check if detection was already run (stored in session state)
                             if 'hidden_text_result' in st.session_state and st.session_state.get('last_pdf_path') == str(pdf_path):
                                 result = st.session_state['hidden_text_result']
@@ -7238,12 +9239,10 @@ def main():
                         adobe_analysis_viewer = None
                         pikepdf_analysis_viewer = None
 
-                        if adobe_exists_viewer or pikepdf_exists_viewer:
-                            # Analyze and identify rare properties
-                            if adobe_exists_viewer:
-                                adobe_analysis_viewer = analyze_adobe_payload(adobe_path_viewer)
-                                if adobe_analysis_viewer:
-                                    rare_adobe_props = identify_rare_font_properties(adobe_analysis_viewer)
+                        if adobe_exists_viewer:
+                            adobe_analysis_viewer = analyze_adobe_payload(adobe_path_viewer)
+                            if adobe_analysis_viewer:
+                                rare_adobe_props = identify_rare_font_properties(adobe_analysis_viewer)
 
                         if pikepdf_exists_viewer:
                             pikepdf_analysis_viewer = analyze_adobe_payload(pikepdf_path_viewer)
@@ -7252,7 +9251,12 @@ def main():
 
                         docling_table_cells = []
                         docling_alignment_items = []
+                        horizontal_alignment_items = []
+                        vertical_alignment_items = []
+                        colon_spacing_items = []
+                        text_blocks_by_page = {}
                         docling_payload_data = None
+                        has_vertical_alignment = False
 
                         if payload_exists and metadata and payload_path and payload_path.exists():
                             try:
@@ -7261,13 +9265,46 @@ def main():
                             except Exception:
                                 docling_payload_data = None
 
-                        if docling_payload_data:
-                            docling_table_cells = extract_table_cells_from_docling(docling_payload_data)
-                            docling_alignment_items = detect_docling_alignment_anomalies(docling_payload_data)
-                            colon_spacing_items = detect_colon_spacing_anomalies(docling_payload_data)
+                        alignment_reporter: Optional[AlignmentLogicReporter] = None
 
-                            # Extract baselines for visualization (stored in payload by detect_docling_alignment_anomalies)
+                        if docling_payload_data:
+                            alignment_reporter = AlignmentLogicReporter(
+                                doc_label=pdf_path.stem if pdf_path else "document",
+                                pdf_path=pdf_path,
+                                output_dir=Path("Alignment logic")
+                            )
+                            if payload_path:
+                                alignment_reporter.add_payload_reference("docling_payload", payload_path)
+
+                            docling_table_cells = extract_table_cells_from_docling(docling_payload_data)
+                            docling_alignment_items = detect_docling_alignment_anomalies(
+                                docling_payload_data,
+                                reporter=alignment_reporter
+                            )
+                            colon_spacing_items = detect_colon_spacing_anomalies(
+                                docling_payload_data,
+                                extract_bbox_coords,
+                                reporter=alignment_reporter
+                            )
+
+                            # Extract baselines and text blocks for visualization
                             alignment_baselines_by_page = docling_payload_data.get("_alignment_baselines", {})
+                            text_blocks_by_page = docling_payload_data.get("_text_blocks", {}) if SHOW_TEXT_BLOCKS else {}
+
+                            # Separate horizontal alignment items for detailed annotation display
+                            horizontal_alignment_items = [
+                                item for item in docling_alignment_items
+                                if item.get('classification', '').startswith('horizontal_misalignment')
+                            ]
+                            vertical_alignment_items = [
+                                item for item in docling_alignment_items
+                                if item.get('classification') == 'vertical_alignment_deviation'
+                            ]
+
+                            if alignment_reporter:
+                                report_path = alignment_reporter.write()
+                                if report_path:
+                                    st.caption(f"Alignment logic report saved to `{report_path.name}`")
 
                             if docling_alignment_items and hidden_text_items:
                                 hidden_boxes_by_page: Dict[int, List[Dict[str, float]]] = defaultdict(list)
@@ -7317,11 +9354,275 @@ def main():
                         has_docling_table_overlays = len(docling_table_cells) > 0
                         has_docling_alignment_issues = len(docling_alignment_items) > 0
                         has_colon_spacing_patterns = len(colon_spacing_items) > 0
+                        has_horizontal_alignment = len(horizontal_alignment_items) > 0
+                        has_vertical_alignment = len(vertical_alignment_items) > 0
+                        has_text_blocks = SHOW_TEXT_BLOCKS and any(text_blocks_by_page.values()) if text_blocks_by_page else False
+                        has_rare_font_overlay_data = bool(rare_adobe_props or rare_pikepdf_props)
 
                         # Show viewer if we have anything to annotate
-                        if has_hidden_text_result or rare_adobe_props or rare_pikepdf_props or has_docling_table_overlays or has_docling_alignment_issues or has_colon_spacing_patterns:
+                        if has_hidden_text_result or has_rare_font_overlay_data or has_docling_table_overlays or has_docling_alignment_issues or has_colon_spacing_patterns or has_horizontal_alignment or has_vertical_alignment or has_text_blocks:
                             st.markdown("---")
                             st.subheader("📄 Document Viewer with Annotations")
+
+                            # Action buttons for alignment logic
+                            btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+                            with btn_col1:
+                                if st.button("🔄 Recreate Alignment Logic", key="recreate_alignment_btn", use_container_width=True):
+                                    with st.spinner("Recreating alignment logic..."):
+                                        try:
+                                            # Re-run alignment logic
+                                            if not docling_payload_data:
+                                                st.error("No Docling payload data available. Please generate a payload first.")
+                                            else:
+                                                # Create reporter (use relative path since we're already in "Document Pipeline" directory)
+                                                output_dir = Path("Alignment logic")
+                                                alignment_reporter = AlignmentLogicReporter(
+                                                    doc_label=pdf_path.stem if pdf_path else "document",
+                                                    pdf_path=pdf_path,
+                                                    output_dir=output_dir
+                                                )
+
+                                                st.info(f"Reporter created with output_dir: {output_dir.absolute()}")
+
+                                                if payload_path:
+                                                    alignment_reporter.add_payload_reference("docling_payload", payload_path)
+                                                    st.info(f"Added payload reference: {payload_path}")
+
+                                                # Extract table cells
+                                                docling_table_cells = extract_table_cells_from_docling(docling_payload_data)
+                                                st.info(f"Extracted {len(docling_table_cells)} table cells")
+
+                                                # Debug table extraction
+                                                doc_struct = docling_payload_data.get("docling_document", {})
+                                                tables = doc_struct.get("tables", [])
+                                                st.info(f"Table extraction debug: docling_document exists={bool(doc_struct)}, tables count={len(tables) if isinstance(tables, list) else 'not a list'}")
+
+                                                # Run detection with reporter
+                                                docling_alignment_items = detect_docling_alignment_anomalies(
+                                                    docling_payload_data,
+                                                    reporter=alignment_reporter
+                                                )
+                                                st.info(f"Detected {len(docling_alignment_items)} alignment anomalies")
+
+                                                colon_spacing_items = detect_colon_spacing_anomalies(
+                                                    docling_payload_data,
+                                                    extract_bbox_coords,
+                                                    reporter=alignment_reporter
+                                                )
+                                                st.info(f"Detected {len(colon_spacing_items)} colon spacing items")
+
+                                                # Extract baselines and text blocks for visualization
+                                                alignment_baselines_by_page = docling_payload_data.get("_alignment_baselines", {})
+                                                text_blocks_by_page = docling_payload_data.get("_text_blocks", {}) if SHOW_TEXT_BLOCKS else {}
+
+                                                # Filter out alignment items that overlap with hidden text
+                                                if docling_alignment_items and hidden_text_items:
+                                                    st.info("Filtering alignment items that overlap with hidden text...")
+                                                    hidden_boxes_by_page: Dict[int, List[Dict[str, float]]] = defaultdict(list)
+                                                    for hidden_item in hidden_text_items:
+                                                        page_index = hidden_item.get('page')
+                                                        if page_index is None:
+                                                            continue
+
+                                                        for bbox_key in ('visible_bbox', 'hidden_bbox'):
+                                                            bbox_value = hidden_item.get(bbox_key)
+                                                            if not isinstance(bbox_value, dict):
+                                                                continue
+                                                            try:
+                                                                hx0, hy0, hx1, hy1 = extract_bbox_coords(bbox_value)
+                                                            except Exception:
+                                                                continue
+                                                            hidden_boxes_by_page[int(page_index)].append({
+                                                                "x0": hx0,
+                                                                "y0": hy0,
+                                                                "x1": hx1,
+                                                                "y1": hy1
+                                                            })
+
+                                                    if hidden_boxes_by_page:
+                                                        filtered_alignment_items: List[Dict[str, Any]] = []
+                                                        for alignment_item in docling_alignment_items:
+                                                            bbox = alignment_item.get('bbox')
+                                                            page_index = alignment_item.get('page')
+                                                            if not bbox:
+                                                                continue
+
+                                                            overlaps_hidden = False
+                                                            if page_index in hidden_boxes_by_page:
+                                                                for hidden_bbox in hidden_boxes_by_page[page_index]:
+                                                                    try:
+                                                                        if calculate_iou(bbox, hidden_bbox) > 0.05:
+                                                                            overlaps_hidden = True
+                                                                            break
+                                                                    except Exception:
+                                                                        continue
+
+                                                            if not overlaps_hidden:
+                                                                filtered_alignment_items.append(alignment_item)
+
+                                                        docling_alignment_items = filtered_alignment_items
+                                                        st.info(f"Filtered to {len(docling_alignment_items)} non-overlapping items")
+
+                                                # Separate horizontal alignment items
+                                                horizontal_alignment_items = [
+                                                    item for item in docling_alignment_items
+                                                    if item.get('classification', '').startswith('horizontal_misalignment')
+                                                ]
+                                                vertical_alignment_items = [
+                                                    item for item in docling_alignment_items
+                                                    if item.get('classification') == 'vertical_alignment_deviation'
+                                                ]
+
+                                                # Write the report
+                                                st.info(f"Reporter dirty flag: {alignment_reporter._dirty}")
+                                                st.info(f"Attempting to write report to: {alignment_reporter.output_dir.absolute()}")
+
+                                                report_path = alignment_reporter.write()
+
+                                                if report_path:
+                                                    st.success(f"✅ Alignment logic recreated! Report saved to `{report_path.name}`")
+                                                    st.info(f"Full path: {report_path.absolute()}")
+                                                else:
+                                                    st.warning("⚠️ Report path was None. Reporter may not have been marked dirty.")
+                                                    st.info(f"Reporter data pages: {list(alignment_reporter.data.get('pages', {}).keys())}")
+
+                                                # Update flags
+                                                has_docling_table_overlays = len(docling_table_cells) > 0
+                                                has_docling_alignment_issues = len(docling_alignment_items) > 0
+                                                has_colon_spacing_patterns = len(colon_spacing_items) > 0
+                                                has_horizontal_alignment = len(horizontal_alignment_items) > 0
+                                                has_vertical_alignment = len(vertical_alignment_items) > 0
+                                                has_text_blocks = SHOW_TEXT_BLOCKS and any(text_blocks_by_page.values()) if text_blocks_by_page else False
+
+                                                st.rerun()
+
+                                        except Exception as e:
+                                            st.error(f"Error recreating alignment logic: {e}")
+                                            import traceback
+                                            st.code(traceback.format_exc())
+
+                            with btn_col2:
+                                if st.button("↻ Refresh Document", key="refresh_document_btn", use_container_width=True):
+                                    with st.spinner("Refreshing document from saved data..."):
+                                        # Load alignment logic from JSON file
+                                        alignment_logic_dir = Path("Alignment logic")
+                                        if alignment_logic_dir.exists() and pdf_path:
+                                            doc_name = pdf_path.stem
+                                            # Find the most recent alignment logic file for this document
+                                            matching_files = list(alignment_logic_dir.glob(f"*{doc_name}_alignment_logic.json"))
+                                            if matching_files:
+                                                # Sort by modification time, get the most recent
+                                                latest_file = max(matching_files, key=lambda p: p.stat().st_mtime)
+
+                                                try:
+                                                    with open(latest_file, 'r', encoding='utf-8') as f:
+                                                        alignment_data = json.load(f)
+
+                                                    st.success(f"✅ Loaded alignment logic from `{latest_file.name}`")
+
+                                                    # Note: The alignment logic JSON contains diagnostic data, not the full
+                                                    # detection results needed for rendering. We need to re-run the detection
+                                                    # but this time reading from the existing docling payload which already
+                                                    # has the baselines stored in it.
+                                                    if docling_payload_data:
+                                                        # Extract the stored results from payload
+                                                        alignment_baselines_by_page = docling_payload_data.get("_alignment_baselines", {})
+                                                        text_blocks_by_page = docling_payload_data.get("_text_blocks", {}) if SHOW_TEXT_BLOCKS else {}
+
+                                                        # Re-run detection to get items (but baselines already calculated)
+                                                        docling_table_cells = extract_table_cells_from_docling(docling_payload_data)
+                                                        docling_alignment_items = detect_docling_alignment_anomalies(docling_payload_data, reporter=None)
+                                                        colon_spacing_items = detect_colon_spacing_anomalies(docling_payload_data, extract_bbox_coords, reporter=None)
+
+                                                    # Load hidden text detection results if they exist
+                                                    if 'hidden_text_result' not in st.session_state or st.session_state.get('last_pdf_path') != str(pdf_path):
+                                                        detection_exists, detection_path, _ = check_overlapping_bboxes_exists(pdf_path)
+                                                        if detection_exists and detection_path:
+                                                            try:
+                                                                with open(detection_path, 'r', encoding='utf-8') as f:
+                                                                    detection_result = json.load(f)
+                                                                    st.session_state['hidden_text_result'] = detection_result
+                                                                    st.session_state['last_pdf_path'] = str(pdf_path)
+
+                                                                    # Update hidden text items
+                                                                    if detection_result and not detection_result.get('error'):
+                                                                        hidden_text_items = detection_result.get('hidden_items', [])
+                                                                        has_hidden_text_result = len(hidden_text_items) > 0
+                                                            except Exception as e:
+                                                                st.warning(f"Could not load hidden text detection: {e}")
+
+                                                    # Filter out alignment items that overlap with hidden text
+                                                    if docling_payload_data and docling_alignment_items and hidden_text_items:
+                                                        hidden_boxes_by_page: Dict[int, List[Dict[str, float]]] = defaultdict(list)
+                                                        for hidden_item in hidden_text_items:
+                                                            page_index = hidden_item.get('page')
+                                                            if page_index is None:
+                                                                continue
+
+                                                            for bbox_key in ('visible_bbox', 'hidden_bbox'):
+                                                                bbox_value = hidden_item.get(bbox_key)
+                                                                if not isinstance(bbox_value, dict):
+                                                                    continue
+                                                                try:
+                                                                    hx0, hy0, hx1, hy1 = extract_bbox_coords(bbox_value)
+                                                                except Exception:
+                                                                    continue
+                                                                hidden_boxes_by_page[int(page_index)].append({
+                                                                    "x0": hx0,
+                                                                    "y0": hy0,
+                                                                    "x1": hx1,
+                                                                    "y1": hy1
+                                                                })
+
+                                                        if hidden_boxes_by_page:
+                                                            filtered_alignment_items: List[Dict[str, Any]] = []
+                                                            for alignment_item in docling_alignment_items:
+                                                                bbox = alignment_item.get('bbox')
+                                                                page_index = alignment_item.get('page')
+                                                                if not bbox:
+                                                                    continue
+
+                                                                overlaps_hidden = False
+                                                                if page_index in hidden_boxes_by_page:
+                                                                    for hidden_bbox in hidden_boxes_by_page[page_index]:
+                                                                        try:
+                                                                            if calculate_iou(bbox, hidden_bbox) > 0.05:
+                                                                                overlaps_hidden = True
+                                                                                break
+                                                                        except Exception:
+                                                                            continue
+
+                                                                if not overlaps_hidden:
+                                                                    filtered_alignment_items.append(alignment_item)
+
+                                                            docling_alignment_items = filtered_alignment_items
+
+                                                    if docling_payload_data:
+                                                        # Separate horizontal alignment items
+                                                        horizontal_alignment_items = [
+                                                            item for item in docling_alignment_items
+                                                            if item.get('classification', '').startswith('horizontal_misalignment')
+                                                        ]
+                                                    vertical_alignment_items = [
+                                                        item for item in docling_alignment_items
+                                                        if item.get('classification') == 'vertical_alignment_deviation'
+                                                    ]
+
+                                                    has_docling_table_overlays = len(docling_table_cells) > 0
+                                                    has_docling_alignment_issues = len(docling_alignment_items) > 0
+                                                    has_colon_spacing_patterns = len(colon_spacing_items) > 0
+                                                    has_horizontal_alignment = len(horizontal_alignment_items) > 0
+                                                    has_vertical_alignment = len(vertical_alignment_items) > 0
+                                                    has_text_blocks = SHOW_TEXT_BLOCKS and any(text_blocks_by_page.values()) if text_blocks_by_page else False
+
+                                                    st.rerun()
+
+                                                except Exception as e:
+                                                    st.error(f"Error loading alignment logic: {e}")
+                                            else:
+                                                st.warning(f"No alignment logic file found for document `{doc_name}`. Click 'Recreate Alignment Logic' first.")
+                                        else:
+                                            st.warning("Alignment logic folder not found or no document selected.")
 
                             # Get page count
                             try:
@@ -7342,50 +9643,150 @@ def main():
                             else:
                                 selected_page = 0
 
-                            # Render options
-                            render_col1, render_col2 = st.columns([3, 1])
-                            with render_col1:
-                                st.caption("Annotations show hidden text and rare font properties")
-                                if has_docling_table_overlays or has_docling_alignment_issues:
-                                    st.caption("Additional overlays include Docling tables and alignment anomalies")
-                                if has_colon_spacing_patterns:
-                                    st.caption("Colon spacing patterns: Green=consistent, Red=deviation, Orange=right-aligned")
-                            with render_col2:
+                            # DPI selector
+                            dpi_col1, dpi_col2 = st.columns([1, 3])
+                            with dpi_col1:
                                 dpi = st.selectbox("DPI:", options=[100, 150, 200, 300], index=1, key="render_dpi")
+
+                            # Checkboxes for overlay controls - spread horizontally
+                            st.caption("**Overlay controls:**")
+                            cb_col1, cb_col2, cb_col3, cb_col4, cb_col5, cb_col6, cb_col7 = st.columns(7)
+                            with cb_col1:
+                                show_table_cells = st.checkbox(
+                                    "Table cells",
+                                    value=SHOW_TABLE_CELLS_DEFAULT,
+                                    key="render_table_cells"
+                                )
+                            with cb_col2:
+                                show_hidden_text = st.checkbox(
+                                    "Hidden text",
+                                    value=SHOW_HIDDEN_TEXT_DEFAULT,
+                                    key="render_hidden_text"
+                                )
+                            with cb_col3:
+                                show_rare_font_props = st.checkbox(
+                                    "Rare font overlays",
+                                    value=SHOW_RARE_FONT_PROPERTIES_DEFAULT,
+                                    key="render_rare_font_overlays"
+                                )
+                            with cb_col4:
+                                show_vertical_alignment = st.checkbox(
+                                    "Vertical alignment",
+                                    value=SHOW_VERTICAL_ALIGNMENT_DEFAULT,
+                                    key="render_vertical_alignment"
+                                )
+                            with cb_col5:
+                                show_horizontal_alignment = st.checkbox(
+                                    "Horizontal alignment",
+                                    value=SHOW_HORIZONTAL_ALIGNMENT_DEFAULT,
+                                    key="render_horizontal_alignment"
+                                )
+                            with cb_col6:
+                                show_text_blocks = st.checkbox(
+                                    "Text blocks",
+                                    value=SHOW_TEXT_BLOCKS_DEFAULT,
+                                    key="render_text_blocks"
+                                )
+                            with cb_col7:
+                                show_alignment_features = st.checkbox(
+                                    "Alignment features",
+                                    value=SHOW_ALIGNMENT_FEATURES_DEFAULT,
+                                    key="render_alignment_features"
+                                )
+
+                            # Check if alignment baselines exist
+                            has_alignment_baselines = 'alignment_baselines_by_page' in locals() and bool(alignment_baselines_by_page)
+
+                            active_table_cells = show_table_cells and has_docling_table_overlays
+                            active_hidden_text = show_hidden_text and has_hidden_text_result
+                            active_rare_font_overlays = show_rare_font_props and has_rare_font_overlay_data
+                            active_vertical_alignment = show_vertical_alignment and has_vertical_alignment
+                            active_horizontal_alignment = show_horizontal_alignment and has_horizontal_alignment
+                            active_text_blocks = show_text_blocks and has_text_blocks
+                            active_colon_spacing = show_alignment_features and has_colon_spacing_patterns
+                            active_docling_alignment = show_alignment_features and has_docling_alignment_issues
+                            active_vertical_baselines = show_vertical_alignment and has_alignment_baselines
+                            active_horizontal_baselines = show_horizontal_alignment and has_alignment_baselines
+
+                            # Overlay information
+                            overlay_labels = []
+                            if active_table_cells:
+                                overlay_labels.append("table cells (green)")
+                            if active_hidden_text:
+                                overlay_labels.append("hidden text")
+                            if active_rare_font_overlays:
+                                overlay_labels.append("rare font properties")
+                            if active_docling_alignment:
+                                overlay_labels.append("Docling alignment anomalies")
+                            if active_colon_spacing:
+                                overlay_labels.append("colon spacing patterns")
+                            if active_horizontal_baselines:
+                                overlay_labels.append("horizontal alignment lines (purple)")
+                            if active_horizontal_alignment:
+                                overlay_labels.append("horizontal misalignment items")
+                            if active_vertical_baselines:
+                                overlay_labels.append("vertical alignment lines (cyan/orange)")
+                            if active_vertical_alignment:
+                                overlay_labels.append("vertical alignment anomalies")
+                            if active_text_blocks:
+                                overlay_labels.append("text block outlines")
+
+                            if overlay_labels:
+                                st.caption("Annotations show " + ", ".join(overlay_labels) + ".")
+                            if active_vertical_alignment:
+                                st.caption("Vertical alignment anomalies use blue rectangles to highlight misaligned values.")
 
                             # Render the page with annotations
                             with st.spinner(f"Rendering page {selected_page + 1} with annotations..."):
-                                # Get baselines for the selected page
+                                # Get baselines for the selected page and filter by orientation based on checkboxes
                                 page_baselines = None
                                 if 'alignment_baselines_by_page' in locals() and alignment_baselines_by_page:
-                                    page_baselines = alignment_baselines_by_page.get(selected_page)
+                                    all_baselines = alignment_baselines_by_page.get(selected_page, [])
+                                    if all_baselines:
+                                        filtered_baselines = []
+                                        for baseline in all_baselines:
+                                            orientation = baseline.get('orientation', '')
+                                            # Vertical lines: left/right orientations
+                                            if orientation in ['left', 'right'] and show_vertical_alignment:
+                                                filtered_baselines.append(baseline)
+                                            # Horizontal lines: top/bottom orientations
+                                            elif orientation in ['top', 'bottom'] and show_horizontal_alignment:
+                                                filtered_baselines.append(baseline)
+                                        page_baselines = filtered_baselines if filtered_baselines else None
 
                                 annotated_img = render_pdf_with_annotations(
                                     pdf_path=pdf_path,
                                     page_num=selected_page,
-                                    hidden_text_items=hidden_text_items if has_hidden_text_result else None,
-                                    rare_adobe_properties=rare_adobe_props,
-                                    rare_pikepdf_properties=rare_pikepdf_props,
-                                    docling_table_cells=docling_table_cells if has_docling_table_overlays else None,
-                                    alignment_anomalies=docling_alignment_items if has_docling_alignment_issues else None,
+                                    hidden_text_items=hidden_text_items if active_hidden_text else None,
+                                    rare_adobe_properties=rare_adobe_props if active_rare_font_overlays else None,
+                                    rare_pikepdf_properties=rare_pikepdf_props if active_rare_font_overlays else None,
+                                    docling_table_cells=docling_table_cells if active_table_cells else None,
+                                    alignment_anomalies=docling_alignment_items if active_docling_alignment else None,
                                     alignment_baselines=page_baselines,
-                                    colon_spacing_items=colon_spacing_items if has_colon_spacing_patterns else None,
+                                    colon_spacing_items=colon_spacing_items if active_colon_spacing else None,
+                                    text_blocks=text_blocks_by_page.get(selected_page) if active_text_blocks else None,
+                                    horizontal_alignment_items=horizontal_alignment_items if active_horizontal_alignment else None,
+                                    vertical_alignment_items=vertical_alignment_items if active_vertical_alignment else None,
                                     dpi=dpi
                                 )
 
                                 if annotated_img:
                                     # Display the annotated image
-                                    st.image(annotated_img, caption=f"Page {selected_page + 1} with annotations", use_container_width=True)
+                                    st.image(annotated_img, caption=f"Page {selected_page + 1} with annotations", width='stretch')
 
                                     # Build detailed annotation information
                                     annotation_details = build_annotation_details(
                                         page_num=selected_page,
-                                        hidden_text_items=hidden_text_items if has_hidden_text_result else None,
-                                        rare_adobe_properties=rare_adobe_props,
-                                        rare_pikepdf_properties=rare_pikepdf_props,
-                                        adobe_analysis=adobe_analysis_viewer if adobe_exists_viewer else None,
-                                        pikepdf_analysis=pikepdf_analysis_viewer if pikepdf_exists_viewer else None,
-                                        docling_alignment_items=docling_alignment_items if has_docling_alignment_issues else None
+                                        hidden_text_items=hidden_text_items if active_hidden_text else None,
+                                        rare_adobe_properties=rare_adobe_props if active_rare_font_overlays else None,
+                                        rare_pikepdf_properties=rare_pikepdf_props if active_rare_font_overlays else None,
+                                        adobe_analysis=adobe_analysis_viewer if (active_rare_font_overlays and adobe_exists_viewer) else None,
+                                        pikepdf_analysis=pikepdf_analysis_viewer if (active_rare_font_overlays and pikepdf_exists_viewer) else None,
+                                        docling_alignment_items=docling_alignment_items if active_docling_alignment else None,
+                                        colon_spacing_items=colon_spacing_items if active_colon_spacing else None,
+                                        horizontal_alignment_items=horizontal_alignment_items if active_horizontal_alignment else None,
+                                        vertical_alignment_items=vertical_alignment_items if active_vertical_alignment else None,
+                                        text_blocks=text_blocks_by_page.get(selected_page) if active_text_blocks else None
                                     )
 
                                     # Display annotation details
@@ -7403,6 +9804,22 @@ def main():
                                                 color_html = f'<div style="display: inline-block; width: 20px; height: 20px; background-color: {item["color"]}; border: 1px solid #000; vertical-align: middle; margin-right: 5px;"></div>'
                                                 st.markdown(f"**Highlight Color:** {color_html} {item['color_name']}", unsafe_allow_html=True)
 
+                                                # Display font information if available
+                                                font_info = item.get('font_info')
+                                                if font_info:
+                                                    font_parts = []
+                                                    if 'font_name' in font_info:
+                                                        font_parts.append(f"Name: {font_info['font_name']}")
+                                                    if 'font_family' in font_info:
+                                                        font_parts.append(f"Family: {font_info['font_family']}")
+                                                    if 'font_size' in font_info:
+                                                        font_parts.append(f"Size: {font_info['font_size']}")
+                                                    if 'font' in font_info:
+                                                        font_parts.append(f"Font: {font_info['font']}")
+
+                                                    if font_parts:
+                                                        st.markdown(f"**Font:** {', '.join(font_parts)}")
+
                                                 # Display reasons
                                                 st.markdown(f"**Reason(s):** {len(item['reasons'])} issue(s) detected")
 
@@ -7413,6 +9830,69 @@ def main():
                                                     # Show hidden text if this is an overlap
                                                     if 'hidden_text' in reason:
                                                         st.caption(f"   Hidden text beneath: `{reason['hidden_text']}`")
+
+                                    # Display baseline detection debug info
+                                    debug_key = f"_baseline_debug_{selected_page}"
+                                    if debug_key in docling_payload_data:
+                                        debug_info = docling_payload_data[debug_key]
+                                        with st.expander("🔍 Baseline Detection Debug Info", expanded=False):
+                                            st.markdown(f"**Total cells:** {debug_info.get('total_cells', 0)}")
+                                            st.markdown(f"**Filtered cells:** {debug_info.get('filtered_cells', 0)}")
+                                            st.markdown(f"**Baselines found:** {debug_info.get('baselines_found', 0)}")
+
+                                            # Show cluster statistics
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.markdown("**Left Edge Clusters (top 10):**")
+                                                left_clusters = debug_info.get('left_clusters', {})
+                                                if left_clusters:
+                                                    for x_val, count in list(left_clusters.items())[:10]:
+                                                        st.text(f"  x={x_val:.1f}pt: {count} cells")
+                                                else:
+                                                    st.text("  None found")
+
+                                                st.markdown("**Top Edge Clusters (top 10):**")
+                                                top_clusters = debug_info.get('top_clusters', {})
+                                                if top_clusters:
+                                                    for y_val, count in list(top_clusters.items())[:10]:
+                                                        st.text(f"  y={y_val:.1f}pt: {count} cells")
+                                                else:
+                                                    st.text("  None found")
+
+                                            with col2:
+                                                st.markdown("**Right Edge Clusters (top 10):**")
+                                                right_clusters = debug_info.get('right_clusters', {})
+                                                if right_clusters:
+                                                    for x_val, count in list(right_clusters.items())[:10]:
+                                                        st.text(f"  x={x_val:.1f}pt: {count} cells")
+                                                else:
+                                                    st.text("  None found")
+
+                                                st.markdown("**Bottom Edge Clusters (top 10):**")
+                                                bottom_clusters = debug_info.get('bottom_clusters', {})
+                                                if bottom_clusters:
+                                                    for y_val, count in list(bottom_clusters.items())[:10]:
+                                                        st.text(f"  y={y_val:.1f}pt: {count} cells")
+                                                else:
+                                                    st.text("  None found")
+
+                                            # Show rejected baselines
+                                            rejected = debug_info.get('baselines_rejected', [])
+                                            if rejected:
+                                                st.markdown(f"**Rejected Baselines ({len(rejected)}):**")
+                                                st.caption("These clusters were found but didn't meet the minimum threshold")
+                                                for item in rejected[:20]:  # Show max 20
+                                                    st.text(f"  {item['orientation']}: {item['value']:.1f}pt ({item['count']} cells) - {item['reason']}")
+
+                                            # Show sample cells with their coordinates
+                                            sample_cells = debug_info.get('sample_cells', [])
+                                            if sample_cells:
+                                                st.markdown("---")
+                                                st.markdown(f"**Sample Cells (first {len(sample_cells)}):**")
+                                                st.caption("Shows each cell's text and bounding box coordinates")
+                                                for cell in sample_cells:
+                                                    st.text(f"  '{cell['text']}' @ x0={cell['x0']}pt, y0={cell['y0']}pt, x1={cell['x1']}pt, y1={cell['y1']}pt")
+
                                     else:
                                         st.info("No annotations on this page")
                                 else:

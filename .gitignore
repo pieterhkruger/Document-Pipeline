@@ -87,7 +87,11 @@ pikepdf payloads/
 PDF processing/
 Overlapping bboxes/
 Enhanced text info/
-Cluster results/
+PDFPlumber payloads/
+PyMuPDF payloads/
+Alignment logic/
+Cluster Results/
+
 
 # ---- But DO commit the template(s) ----
 !.env_example
